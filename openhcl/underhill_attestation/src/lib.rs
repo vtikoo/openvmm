@@ -16,6 +16,7 @@ mod igvm_attest;
 mod key_protector;
 mod secure_key_release;
 mod vmgs;
+mod tdisp;
 
 pub use igvm_attest::ak_cert::parse_response as parse_ak_cert_response;
 pub use igvm_attest::Error as IgvmAttestError;
@@ -275,6 +276,8 @@ pub async fn initialize_platform_security(
         AttestationType::Tdx => Some(Box::new(tee_call::TdxCall)),
         AttestationType::Host => None,
     };
+
+    // TODO: do TDISP init-time claims work
 
     let VmgsEncryptionKeys {
         ingress_rsa_kek,

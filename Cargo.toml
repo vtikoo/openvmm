@@ -384,6 +384,7 @@ base64-serde = "0.7"
 bitfield-struct = "0.7"
 bitvec = { version = "1.1", default-features = false }
 blocking = "1.2"
+bytes = "1.7.1"
 caps = "0.5"
 cargo_toml = "0.18"
 cc = "1.0"
