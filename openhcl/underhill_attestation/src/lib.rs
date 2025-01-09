@@ -15,8 +15,8 @@ mod hardware_key_sealing;
 mod igvm_attest;
 mod key_protector;
 mod secure_key_release;
-mod vmgs;
 mod tdisp;
+mod vmgs;
 
 pub use igvm_attest::ak_cert::parse_response as parse_ak_cert_response;
 pub use igvm_attest::Error as IgvmAttestError;
