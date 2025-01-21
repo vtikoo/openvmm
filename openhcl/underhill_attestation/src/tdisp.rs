@@ -5,10 +5,12 @@
 //! Host passes Node BOM document to underhill, which uses it
 //! as the policy for attesting devices.
 
+mod measurement;
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fmt;
 
 use bytes::{Buf, Bytes};
@@ -50,7 +52,6 @@ pub struct DeviceManifest {
 }
 
 impl DeviceManifest {
-
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
@@ -58,7 +59,6 @@ impl DeviceManifest {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,7 +92,8 @@ impl TryFrom<&[u8]> for SpdmMeasurementRequestMessage {
         let mut buf = Bytes::copy_from_slice(data);
 
         // TODO: remove hardcoded value with defined constant
-        if buf.remaining() < 37 {  // Total size: 1 + 1 + 1 + 1 + 32 + 1 = 37
+        if buf.remaining() < 37 {
+            // Total size: 1 + 1 + 1 + 1 + 32 + 1 = 37
             return Err("Buffer too short".to_string());
         }
 
@@ -100,10 +101,10 @@ impl TryFrom<&[u8]> for SpdmMeasurementRequestMessage {
         let request_response_code = buf.get_u8();
         let param1 = buf.get_u8();
         let param2 = buf.get_u8();
-        
+
         let mut nonce = [0u8; 32];
         buf.copy_to_slice(&mut nonce);
-        
+
         let slot_id_param = buf.get_u8();
 
         if !buf.is_empty() {
@@ -125,7 +126,6 @@ impl TryFrom<&[u8]> for SpdmMeasurementRequestMessage {
         })
     }
 }
-
 
 #[derive(Debug)]
 pub struct DmtfMeasurement {
@@ -151,7 +151,9 @@ impl TryFrom<&[u8]> for DmtfMeasurement {
             return Err("Buffer too short for measurement value".to_string());
         }
 
-        let dmtf_spec_measurement_value = buf.split_to(dmtf_spec_measurement_value_size as usize).to_vec();
+        let dmtf_spec_measurement_value = buf
+            .split_to(dmtf_spec_measurement_value_size as usize)
+            .to_vec();
 
         if !buf.is_empty() {
             eprintln!("Warning: {} bytes left after parsing", buf.remaining());
@@ -170,7 +172,11 @@ impl fmt::Display for DmtfMeasurement {
         writeln!(f, "DmtfMeasurement:")?;
         write!(f, "Type: {} ", self.dmtf_spec_measurement_value_type)?;
         writeln!(f, "Size: {}", self.dmtf_spec_measurement_value_size)?;
-        writeln!(f, "Value as hex string: {:?}", hex::encode(&self.dmtf_spec_measurement_value))?;
+        writeln!(
+            f,
+            "Value as hex string: {:?}",
+            hex::encode(&self.dmtf_spec_measurement_value)
+        )?;
         //writeln!(f, "Value: {:?}", self.dmtf_spec_measurement_value)?;
 
         Ok(())
@@ -188,7 +194,10 @@ impl MeasurementRecord {
         self.measurement_blocks
             .iter()
             .map(|(&index, measurement)| {
-                (index - 1, hex::encode(&measurement.dmtf_spec_measurement_value))
+                (
+                    index - 1,
+                    hex::encode(&measurement.dmtf_spec_measurement_value),
+                )
             })
             .collect()
     }
@@ -223,8 +232,9 @@ impl TryFrom<(&[u8], u8)> for MeasurementRecord {
                 return Err("Buffer too short for measurement value".to_string());
             }
 
-            let dmtf_measurement = DmtfMeasurement::try_from(buf.split_to(measurement_size).to_vec().as_slice())
-                .map_err(|e| format!("Failed to parse DMTF measurement: {}", e))?;
+            let dmtf_measurement =
+                DmtfMeasurement::try_from(buf.split_to(measurement_size).to_vec().as_slice())
+                    .map_err(|e| format!("Failed to parse DMTF measurement: {}", e))?;
 
             measurement_blocks.insert(index, dmtf_measurement);
         }
@@ -249,7 +259,7 @@ impl fmt::Display for MeasurementRecord {
                 writeln!(f, "Measurement Index {} {}", index, measurement)?;
             }
         }
-        
+
         Ok(())
     }
 }
@@ -279,37 +289,42 @@ impl TryFrom<&[u8]> for SpdmMeasurementResponseMessage {
     fn try_from(response_data: &[u8]) -> Result<Self, Self::Error> {
         let mut buf = Bytes::copy_from_slice(response_data);
 
-        if buf.remaining() < 41 {  // Minimum size for fixed fields
+        if buf.remaining() < 41 {
+            // Minimum size for fixed fields
             return Err("Buffer too short for fixed fields".to_string());
         }
 
         let spdm_version = buf.get_u8();
         let request_response_code = buf.get_u8();
         if request_response_code != 0x60 {
-            return Err(format!("Invalid request_response_code: 0x{:x}", request_response_code));
+            return Err(format!(
+                "Invalid request_response_code: 0x{:x}",
+                request_response_code
+            ));
         }
         let param1 = buf.get_u8();
         let param2 = buf.get_u8();
         let number_of_blocks = buf.get_u8();
         let measurement_record_length = buf.get_uint_le(3) as u32;
-        let signature_length = 96;  // Hardcoded for now
-        // print all the fields
+        let signature_length = 96; // Hardcoded for now
+                                   // print all the fields
 
         if buf.remaining() < measurement_record_length as usize + 34 + signature_length {
             return Err("Buffer too short for variable length fields".to_string());
         }
 
         let raw_record = buf.split_to(measurement_record_length as usize).to_vec();
-        let measurement_record = MeasurementRecord::try_from((raw_record.to_vec().as_slice(), number_of_blocks))
-            .map_err(|e| format!("Failed to parse measurement record: {}", e))?;
+        let measurement_record =
+            MeasurementRecord::try_from((raw_record.to_vec().as_slice(), number_of_blocks))
+                .map_err(|e| format!("Failed to parse measurement record: {}", e))?;
 
         let mut nonce = [0u8; 32];
         buf.copy_to_slice(&mut nonce);
 
         let opaque_length = buf.get_u16_le();
-        let opaque_data = OpaqueData {};  // TODO
-        // let opaque_data = OpaqueData::try_from(buf.split_to(opaque_length as usize).as_ref())
-        //     .map_err(|e| format!("Failed to parse opaque data: {}", e))?;
+        let opaque_data = OpaqueData {}; // TODO
+                                         // let opaque_data = OpaqueData::try_from(buf.split_to(opaque_length as usize).as_ref())
+                                         //     .map_err(|e| format!("Failed to parse opaque data: {}", e))?;
 
         let signature = buf.split_to(signature_length).to_vec();
 
@@ -348,7 +363,11 @@ impl fmt::Display for SpdmMeasurementResponseMessage {
         writeln!(f, "Param1: {}", self.param1)?;
         writeln!(f, "Param2: {}", self.param2)?;
         writeln!(f, "NumberOfBlocks: {}", self.number_of_blocks)?;
-        writeln!(f, "MeasurementRecordLength: {}", self.measurement_record_length)?;
+        writeln!(
+            f,
+            "MeasurementRecordLength: {}",
+            self.measurement_record_length
+        )?;
         writeln!(f, "{}", self.measurement_record);
 
         Ok(())
@@ -408,7 +427,6 @@ struct TdispVerifier {
 // make an instance of TdispVerifier
 
 impl TdispVerifier {
-
     pub fn new() -> Self {
         TdispVerifier {
             node_bom: None,
