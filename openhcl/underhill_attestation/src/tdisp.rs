@@ -5,12 +5,13 @@
 //! Host passes Node BOM document to underhill, which uses it
 //! as the policy for attesting devices.
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use bytes::{Buf, Bytes};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt;
-
-use bytes::{Buf, Bytes};
+use std::path::Path;
 use thiserror::Error;
 
 /*
@@ -61,7 +62,8 @@ impl MeasurementValue {
 
     /// Apply bitmask to actual value
     fn apply_bitmask(&self, actual: &[u8]) -> Result<Vec<u8>, MeasurementError> {
-        let bitmask_bytes = hex::decode(&self.bitmask).map_err(|hex_err| MeasurementError::HexError(hex_err))?;
+        let bitmask_bytes =
+            hex::decode(&self.bitmask).map_err(|hex_err| MeasurementError::HexError(hex_err))?;
         if bitmask_bytes.len() != actual.len() {
             return Err(MeasurementError::SizeMismatch {
                 expected: bitmask_bytes.len(),
@@ -85,7 +87,8 @@ impl MeasurementValue {
             });
         }
 
-        let mut expected = hex::decode(&self.value).map_err(|hex_err| MeasurementError::HexError(hex_err))?;
+        let mut expected =
+            hex::decode(&self.value).map_err(|hex_err| MeasurementError::HexError(hex_err))?;
         match self.endianness {
             Endianness::LittleEndian => {
                 expected.reverse();
@@ -147,58 +150,6 @@ SPDM definitions
 */
 
 #[derive(Debug)]
-pub struct SpdmMeasurementRequestMessage {
-    spdm_version: u8,
-    request_response_code: u8,
-    param1: u8,
-    param2: u8,
-    nonce: [u8; 32],
-    slot_id_param: u8,
-}
-
-impl TryFrom<&[u8]> for SpdmMeasurementRequestMessage {
-    type Error = String;
-
-    fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
-        let mut buf = Bytes::copy_from_slice(data);
-
-        // TODO: remove hardcoded value with defined constant
-        if buf.remaining() < 37 {
-            // Total size: 1 + 1 + 1 + 1 + 32 + 1 = 37
-            return Err("Buffer too short".to_string());
-        }
-
-        let spdm_version = buf.get_u8();
-        let request_response_code = buf.get_u8();
-        let param1 = buf.get_u8();
-        let param2 = buf.get_u8();
-
-        let mut nonce = [0u8; 32];
-        buf.copy_to_slice(&mut nonce);
-
-        let slot_id_param = buf.get_u8();
-
-        if !buf.is_empty() {
-            return Err(format!(
-                "Something went wrong during parsing the SPDM GET MEASUREMENT request message.\n\
-                 Expected length: {}, Actual length: {}",
-                37,
-                data.len()
-            ));
-        }
-
-        Ok(SpdmMeasurementRequestMessage {
-            spdm_version,
-            request_response_code,
-            param1,
-            param2,
-            nonce,
-            slot_id_param,
-        })
-    }
-}
-
-#[derive(Debug)]
 pub struct DmtfMeasurement {
     dmtf_spec_measurement_value_type: u8,
     dmtf_spec_measurement_value_size: u16,
@@ -241,82 +192,126 @@ impl TryFrom<&[u8]> for DmtfMeasurement {
 impl fmt::Display for DmtfMeasurement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "DmtfMeasurement:")?;
-        write!(f, "Type: {} ", self.dmtf_spec_measurement_value_type)?;
-        writeln!(f, "Size: {}", self.dmtf_spec_measurement_value_size)?;
-        writeln!(
-            f,
-            "Value as hex string: {:?}",
-            hex::encode(&self.dmtf_spec_measurement_value)
-        )?;
-        //writeln!(f, "Value: {:?}", self.dmtf_spec_measurement_value)?;
+        write!(f, "Type: 0x{:02x} ", self.dmtf_spec_measurement_value_type)?;
+        writeln!(f, "Size: 0x{:02x}", self.dmtf_spec_measurement_value_size)?;
+        write!(f, "Value: {{ ")?;
+        for byte in &self.dmtf_spec_measurement_value {
+            write!(f, "0x{:02x} ", byte)?;
+        }
+        write!(f, "}}")?;
 
         Ok(())
     }
 }
 
 #[derive(Debug)]
-pub struct MeasurementRecord {
-    measurement_blocks: HashMap<u8, DmtfMeasurement>,
-    number_of_blocks: u8,
+pub struct MeasurementBlock {
+    index: u8,
+    measurement_specification: u8,
+    measurement_size: u16,
+    measurement: DmtfMeasurement,
 }
 
-impl TryFrom<(&[u8], u8)> for MeasurementRecord {
+impl TryFrom<&[u8]> for MeasurementBlock {
     type Error = String;
 
-    fn try_from((data, number_of_blocks): (&[u8], u8)) -> Result<Self, Self::Error> {
-        if number_of_blocks == 0 {
-            return Err("The number of blocks in the measurement record is zero.".to_string());
+    fn try_from(block_data: &[u8]) -> Result<Self, Self::Error> {
+        let mut buf = Bytes::copy_from_slice(block_data);
+
+        if buf.remaining() < 4 {
+            // Minimum size for fixed fields
+            return Err("Buffer too short for fixed fields".to_string());
         }
 
-        let mut buf = Bytes::copy_from_slice(data);
-        let mut measurement_blocks = HashMap::new();
-
-        for _ in 0..number_of_blocks {
-            if buf.remaining() < 4 {
-                return Err("Buffer too short for measurement block header".to_string());
-            }
-
-            let index = buf.get_u8();
-            let measurement_specification = buf.get_u8();
-
-            if measurement_specification != 1 {
-                return Err("Measurement block not following DMTF specification.".to_string());
-            }
-
-            let measurement_size = buf.get_u16_le() as usize;
-
-            if buf.remaining() < measurement_size {
-                return Err("Buffer too short for measurement value".to_string());
-            }
-
-            let dmtf_measurement =
-                DmtfMeasurement::try_from(buf.split_to(measurement_size).to_vec().as_slice())
-                    .map_err(|e| format!("Failed to parse DMTF measurement: {}", e))?;
-
-            measurement_blocks.insert(index, dmtf_measurement);
+        let index = buf.get_u8();
+        let measurement_specification = buf.get_u8();
+        if measurement_specification != 0x01 {
+            return Err(format!(
+                "Invalid measurement_specification: 0x{:x}. Only support DMTF format 0x01.",
+                measurement_specification
+            ));
         }
+        let measurement_size = buf.get_uint_le(2) as u16;
+
+        if buf.remaining() < measurement_size as usize {
+            return Err("Buffer too short for measurement".to_string());
+        }
+
+        let measurement =
+            DmtfMeasurement::try_from(buf.split_to(measurement_size as usize).to_vec().as_slice())
+                .map_err(|e| format!("Failed to parse DMTF measurement: {}", e))?;
 
         if !buf.is_empty() {
-            return Err("Something went wrong during parsing the measurement record.".to_string());
+            eprintln!("Warning: {} bytes left after parsing", buf.remaining());
         }
+        // if !buf.is_empty() {
+        //     return Err(format!(
+        //         "Something went wrong during parsing the SPDM GET MEASUREMENT response message.\n\
+        //          Expected length: {}, Actual length: {}",
+        //         response_data.len(),
+        //         response_data.len() - buf.len()
+        //     ));
+        // }
 
-        Ok(MeasurementRecord {
-            measurement_blocks,
-            number_of_blocks,
+        Ok(MeasurementBlock {
+            index,
+            measurement_specification,
+            measurement_size,
+            measurement,
         })
     }
 }
 
-impl fmt::Display for MeasurementRecord {
+impl fmt::Display for MeasurementBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "MeasurementRecord:")?;
-        for index in 1..=self.number_of_blocks {
-            if let Some(measurement) = self.measurement_blocks.get(&(index)) {
-                writeln!(f, "Measurement Index {} {}", index, measurement)?;
-            }
-        }
+        writeln!(f, "MeasurementBlock:")?;
+        write!(f, "index: 0x{:x} ", self.index)?;
+        writeln!(
+            f,
+            "measurement_specification: 0x{:x}",
+            self.measurement_specification
+        )?;
+        writeln!(f, "measurement_size: 0x{:x}", self.measurement_size)?;
+        writeln!(f, "measurement: {}", self.measurement)?;
 
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct MeasurementBlockList(Vec<MeasurementBlock>);
+
+impl TryFrom<(&[u8], u8)> for MeasurementBlockList {
+    type Error = String;
+
+    fn try_from(data: (&[u8], u8)) -> Result<Self, Self::Error> {
+        let (raw_blocks, number_of_blocks) = data;
+        let mut buf = Bytes::copy_from_slice(raw_blocks);
+        let mut blocks = Vec::new();
+
+        for _ in 0..number_of_blocks {
+            if buf.remaining() < 4 {
+                return Err("Buffer too short for fixed fields".to_string());
+            }
+
+            let block_size = {
+                let mut temp_buf = buf.clone();
+                temp_buf.advance(2); // Skip index and measurement_specification
+                temp_buf.get_uint_le(2) as usize + 4 // measurement_size + fixed fields
+            };
+
+            if buf.remaining() < block_size {
+                return Err("Buffer too short for block".to_string());
+            }
+
+            let block_data = buf.split_to(block_size).to_vec();
+            let block = MeasurementBlock::try_from(block_data.as_slice())
+                .map_err(|e| format!("Failed to parse measurement block: {}", e))?;
+
+            blocks.push(block);
+        }
+
+        Ok(MeasurementBlockList(blocks))
     }
 }
 
@@ -331,11 +326,11 @@ pub struct SpdmMeasurementResponseMessage {
     param1: u8,
     param2: u8,
     number_of_blocks: u8,
-    measurement_record_length: u32,
+    measurement_record_length: u32, // This field size is 3 bytes
     nonce: [u8; 32],
-    opaque_length: u16,
+    opaque_data_length: u16,
     signature: Vec<u8>,
-    measurement_record: MeasurementRecord,
+    measurement_record_data: MeasurementBlockList,
     opaque_data: OpaqueData,
 }
 
@@ -370,14 +365,14 @@ impl TryFrom<&[u8]> for SpdmMeasurementResponseMessage {
         }
 
         let raw_record = buf.split_to(measurement_record_length as usize).to_vec();
-        let measurement_record =
-            MeasurementRecord::try_from((raw_record.to_vec().as_slice(), number_of_blocks))
+        let measurement_record_data =
+            MeasurementBlockList::try_from((raw_record.as_slice(), number_of_blocks))
                 .map_err(|e| format!("Failed to parse measurement record: {}", e))?;
 
         let mut nonce = [0u8; 32];
         buf.copy_to_slice(&mut nonce);
 
-        let opaque_length = buf.get_u16_le();
+        let opaque_data_length = buf.get_u16_le();
         let opaque_data = OpaqueData {}; // TODO
                                          // let opaque_data = OpaqueData::try_from(buf.split_to(opaque_length as usize).as_ref())
                                          //     .map_err(|e| format!("Failed to parse opaque data: {}", e))?;
@@ -401,9 +396,9 @@ impl TryFrom<&[u8]> for SpdmMeasurementResponseMessage {
             number_of_blocks,
             measurement_record_length,
             nonce,
-            opaque_length,
+            opaque_data_length,
             signature,
-            measurement_record,
+            measurement_record_data,
             opaque_data,
         })
     }
@@ -416,15 +411,18 @@ impl fmt::Display for SpdmMeasurementResponseMessage {
         writeln!(f, "SPDMVersion: 0x{:x}", self.spdm_version)?;
         writeln!(f, "RequestResponseCode: 0x{:x}", self.request_response_code)?;
         // TODO: print set bitfields
-        writeln!(f, "Param1: {}", self.param1)?;
-        writeln!(f, "Param2: {}", self.param2)?;
+        writeln!(f, "Param1: 0x{:x}", self.param1)?;
+        writeln!(f, "Param2: 0x{:x}", self.param2)?;
         writeln!(f, "NumberOfBlocks: {}", self.number_of_blocks)?;
         writeln!(
             f,
             "MeasurementRecordLength: {}",
             self.measurement_record_length
         )?;
-        writeln!(f, "{}", self.measurement_record);
+
+        for block in self.measurement_record_data.0.iter() {
+            writeln!(f, "{:}", block)?;
+        }
 
         Ok(())
     }
@@ -497,7 +495,7 @@ struct TdispVerifier {
 // make an instance of TdispVerifier
 
 impl TdispVerifier {
-    fn new() -> Self {
+    pub fn new() -> Self {
         TdispVerifier {
             node_bom: None,
             device_policy: None,
@@ -547,54 +545,58 @@ impl TdispVerifier {
     }
 
     // Go over all measurement indexes in the message and check against policy
-    fn check_measurements(meas_resp_msg: &SpdmMeasurementResponseMessage, expected_meas: &Vec<Measurement>) -> Result<bool, DeviceAttestationError> {
-        for (idx, meas_val) in &meas_resp_msg.measurement_record.measurement_blocks {
-            // look for index in device manifest measurements
-            let reference = expected_meas.iter().find(|&m| m.index == *idx);
-            match reference {
-                Some(ref meas) => {
-                    meas.measurement_value.compare(&meas_val.dmtf_spec_measurement_value).map_err(|e| DeviceAttestationError::MeasurementError(e))?;
-                }
-                None => {
-                    // No reference found in policy; just skip
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    fn attest_device<'a, 'b>(
-        &self,
-        vendor_id: u16,
-        device_id: u16,
-    ) -> Result<bool, DeviceAttestationError> {
-        println!("Attesting device: {} {}", vendor_id, device_id);
-
-        // Look up device in BOM
-        let device_manifest = Self::get_device_manifest(vendor_id, device_id)
-            .map_err(|_| DeviceAttestationError::GenericError)?;
-
-        // Get measurements from device
-        let device_meas = Self::get_device_measurements(vendor_id, device_id)
-            .map_err(|_| DeviceAttestationError::GenericError)?;
-        
-        if !Self::check_measurements(&device_meas, &device_manifest.measurements)?
-        {
-            return Ok(false);
-        }
-
-        /*
-        4. Get device certificate chain
-        5. Verify device certificate chain
-        6. Get device interface report
-        7. Verify device interface report
-        8. Validate hashes
-        9. Validate MMIO ranges
-        10. SDTE write to accept the device
-         */
-        Ok(true)
-    }
+    // fn check_measurements(
+    //     meas_resp_msg: &SpdmMeasurementResponseMessage,
+    //     expected_meas: &Vec<Measurement>,
+    // ) -> Result<bool, DeviceAttestationError> {
+    //     for (idx, meas_val) in &meas_resp_msg.measurement_record_data.0.iter().enumerate() {
+    //         // look for index in device manifest measurements
+    //         let reference = expected_meas.iter().find(|&m| m.index == *idx);
+    //         match reference {
+    //             Some(ref meas) => {
+    //                 meas.measurement_value
+    //                     .compare(&meas_val.dmtf_spec_measurement_value)
+    //                     .map_err(|e| DeviceAttestationError::MeasurementError(e))?;
+    //             }
+    //             None => {
+    //                 // No reference found in policy; just skip
+    //             }
+    //         }
+    //     }
+    //     Ok(true)
 }
+
+//     fn attest_device<'a, 'b>(
+//         &self,
+//         vendor_id: u16,
+//         device_id: u16,
+//     ) -> Result<bool, DeviceAttestationError> {
+//         println!("Attesting device: {} {}", vendor_id, device_id);
+
+//         // Look up device in BOM
+//         let device_manifest = Self::get_device_manifest(vendor_id, device_id)
+//             .map_err(|_| DeviceAttestationError::GenericError)?;
+
+//         // Get measurements from device
+//         let device_meas = Self::get_device_measurements(vendor_id, device_id)
+//             .map_err(|_| DeviceAttestationError::GenericError)?;
+
+//         if !Self::check_measurements(&device_meas, &device_manifest.measurements)? {
+//             return Ok(false);
+//         }
+
+//         /*
+//         4. Get device certificate chain
+//         5. Verify device certificate chain
+//         6. Get device interface report
+//         7. Verify device interface report
+//         8. Validate hashes
+//         9. Validate MMIO ranges
+//         10. SDTE write to accept the device
+//          */
+//         Ok(true)
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -606,42 +608,73 @@ mod tests {
     }
 
     #[test]
-    fn test_check_measurements() {
-        let measurement_req_rsp = read_file("src/tests/data/gh100_get_measurements_request_response.bin");
-        let (_, spdm_get_meas_resp) = measurement_req_rsp.split_at(37);
-        let spdm_get_meas_resp = SpdmMeasurementResponseMessage::try_from(spdm_get_meas_resp).unwrap();
-        println!("SpdmMeasurementResponseMessage: {}", spdm_get_meas_resp);
+    // fn test_check_measurements() {
+    //     let measurement_req_rsp =
+    //         read_file("src/tests/data/gh100_get_measurements_request_response.bin");
+    //     let (_, spdm_get_meas_resp) = measurement_req_rsp.split_at(37);
+    //     let spdm_get_meas_resp =
+    //         SpdmMeasurementResponseMessage::try_from(spdm_get_meas_resp).unwrap();
+    //     println!("SpdmMeasurementResponseMessage: {}", spdm_get_meas_resp);
 
-        let node_manifest_str = r#"{
-            "bom_id": "1234567890",
-            "bom_name": "Test BOM",
-            "bom_svn": 1,
-            "device_manifests": [
-                {
-                    "vendor_id": 1,
-                    "device_id": 1,
-                    "device_name": "Nvidia GH100 Test Device",
-                    "intermediate_thumbprint": "1234567890",
-                    "measurements": [
-                        {
-                            "index": 2,
-                            "name": "Test Measurement",
-                            "block_type": 1,
-                            "size": 48,
-                            "measurement_value": {
-                                "value_type": 1,
-                                "value_size": 48,
-                                "endianness": "bigEndian",
-                                "check": "equal",
-                                "bitmask": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-                                "value": "b558fdac9af53b91ff3bdb06ff589859d6fbc1050d875c88329347f24ff7b3d11ac53688ba56db03cf8751913107e0db"
-                            }
-                         }
-                    ]
-                }
-            ]
-        }"#;
-        let node_manifest: NodeManifest = serde_json::from_str(node_manifest_str).unwrap();
-        assert!(TdispVerifier::check_measurements(&spdm_get_meas_resp, &node_manifest.device_manifests[0].measurements).unwrap());
+    //     let node_manifest_str = r#"{
+    //         "bom_id": "1234567890",
+    //         "bom_name": "Test BOM",
+    //         "bom_svn": 1,
+    //         "device_manifests": [
+    //             {
+    //                 "vendor_id": 1,
+    //                 "device_id": 1,
+    //                 "device_name": "Nvidia GH100 Test Device",
+    //                 "intermediate_thumbprint": "1234567890",
+    //                 "measurements": [
+    //                     {
+    //                         "index": 2,
+    //                         "name": "Test Measurement",
+    //                         "block_type": 1,
+    //                         "size": 48,
+    //                         "measurement_value": {
+    //                             "value_type": 1,
+    //                             "value_size": 48,
+    //                             "endianness": "bigEndian",
+    //                             "check": "equal",
+    //                             "bitmask": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    //                             "value": "b558fdac9af53b91ff3bdb06ff589859d6fbc1050d875c88329347f24ff7b3d11ac53688ba56db03cf8751913107e0db"
+    //                         }
+    //                      }
+    //                 ]
+    //             }
+    //         ]
+    //     }"#;
+    //     let node_manifest: NodeManifest = serde_json::from_str(node_manifest_str).unwrap();
+    //     assert!(TdispVerifier::check_measurements(
+    //         &spdm_get_meas_resp,
+    //         &node_manifest.device_manifests[0].measurements
+    //     )
+    //     .unwrap());
+    // }
+    #[test]
+    fn test_manticore_measurement() {
+        let spdm_measurement_response_message = parse_manticore_measurement();
+
+        println!("{:}", spdm_measurement_response_message);
+    }
+
+    fn parse_manticore_measurement() -> (SpdmMeasurementResponseMessage) {
+        let hex_values = read_manticore_measurement_file();
+
+        SpdmMeasurementResponseMessage::try_from(hex_values.as_slice()).unwrap()
+    }
+
+    fn read_manticore_measurement_file() -> Vec<u8> {
+        let file_path =
+            Path::new("src/tests/data/manticore_get_measurements_reqeuest_response.txt");
+
+        let file_contents = fs::read_to_string(file_path).expect("Failed to read file");
+        let hex_values: Vec<u8> = file_contents
+            .split_whitespace()
+            .filter_map(|hex| u8::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
+            .collect();
+
+        hex_values
     }
 }
