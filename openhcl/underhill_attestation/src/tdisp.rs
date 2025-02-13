@@ -418,6 +418,7 @@ impl fmt::Display for SpdmMeasurementResponseMessage {
             "MeasurementRecordLength: {}",
             self.measurement_record_length
         )?;
+
         for block in self.measurement_record_data.0.iter() {
             writeln!(f, "{:}", block)?;
         }
