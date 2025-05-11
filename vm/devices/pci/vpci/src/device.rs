@@ -1078,7 +1078,7 @@ impl VpciConfigSpace {
 /// PCI Config space offset structure
 #[derive(Debug, Clone, Inspect)]
 #[inspect(transparent)]
-pub struct VpciConfigSpaceOffset(Arc<AtomicU64>);
+pub struct VpciConfigSpaceOffset(#[inspect(hex)] Arc<AtomicU64>);
 
 impl VpciConfigSpaceOffset {
     const INVALID: u64 = !0;
