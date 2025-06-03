@@ -525,6 +525,7 @@ enum ProtocolState {
 
 struct ReadyState {
     send_device: bool,
+    send_completion: Option<u64>,
     vpci_version: protocol::ProtocolVersion,
 }
 
@@ -566,6 +567,7 @@ impl<T: RingMem> VpciChannelState<T> {
                             self.state = ProtocolState::Ready(ReadyState {
                                 vpci_version: version,
                                 send_device: false,
+                                send_completion: None,
                             });
                         }
                     } else {
@@ -639,6 +641,10 @@ impl ReadyState {
                 self.send_child_device(conn, dev).await?;
                 self.send_device = false;
             }
+            if let Some(transaction_id) = self.send_completion {
+                conn.send_completion(Some(transaction_id), &protocol::Status::SUCCESS, &[])?;
+                self.send_completion = None;
+            }
 
             // Don't pull a packets off the ring until there is space for its completion.
             conn.wait_for_completion_space().await?;
@@ -688,8 +694,9 @@ impl ReadyState {
             }
             PacketData::FdoD0Entry { mmio_start } => {
                 dev.config_space.map(mmio_start);
-                conn.send_completion(transaction_id, &protocol::Status::SUCCESS, &[])?;
                 self.send_device = true;
+                // Send the completion after the device has been sent.
+                self.send_completion = transaction_id;
             }
             PacketData::FdoD0Exit => {
                 dev.config_space.unmap();
