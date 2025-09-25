@@ -3813,6 +3813,8 @@ dependencies = [
  "anyhow",
  "hvdef",
  "inspect",
+ "memory_range",
+ "underhill_mem",
  "user_driver",
  "virt",
 ]
@@ -4810,9 +4812,30 @@ dependencies = [
  "memory_range",
  "mesh",
  "page_pool_alloc",
+ "tracing",
  "user_driver",
  "virt",
  "vmcore",
+]
+
+[[package]]
+name = "openhcl_tdisp"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "inspect",
+ "openhcl_tdisp_resources",
+ "tdisp",
+ "tracing",
+]
+
+[[package]]
+name = "openhcl_tdisp_resources"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "inspect",
+ "tdisp",
 ]
 
 [[package]]
@@ -6345,6 +6368,7 @@ dependencies = [
  "nix 0.27.1",
  "static_assertions",
  "thiserror 2.0.12",
+ "tracing",
  "zerocopy 0.8.24",
 ]
 
@@ -6695,6 +6719,20 @@ dependencies = [
  "thiserror 2.0.12",
  "tracing",
  "x86defs",
+]
+
+[[package]]
+name = "tdisp"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bitfield-struct 0.10.1",
+ "inspect",
+ "parking_lot",
+ "static_assertions",
+ "thiserror 2.0.12",
+ "tracing",
+ "zerocopy 0.8.24",
 ]
 
 [[package]]
@@ -7434,6 +7472,8 @@ dependencies = [
  "nvme_resources",
  "openhcl_attestation_protocol",
  "openhcl_dma_manager",
+ "openhcl_tdisp",
+ "openhcl_tdisp_resources",
  "pal",
  "pal_async",
  "pal_uring",
@@ -7448,12 +7488,14 @@ dependencies = [
  "serde_helpers",
  "serde_json",
  "serial_16550_resources",
+ "sev_guest_device",
  "socket2",
  "sparse_mmap",
  "state_unit",
  "storage_string",
  "storvsp",
  "storvsp_resources",
+ "tdisp",
  "tee_call",
  "thiserror 2.0.12",
  "time",
@@ -7679,6 +7721,8 @@ dependencies = [
  "inspect_counters",
  "libc",
  "mesh",
+ "openhcl_tdisp",
+ "openhcl_tdisp_resources",
  "pal_async",
  "pal_event",
  "parking_lot",
@@ -9022,11 +9066,13 @@ dependencies = [
  "guid",
  "inspect",
  "mesh",
+ "openhcl_tdisp_resources",
  "pal_async",
  "parking_lot",
  "pci_core",
  "slab",
  "task_control",
+ "tdisp",
  "test_with_tracing",
  "thiserror 2.0.12",
  "tracelimit",

@@ -11,6 +11,8 @@ hvdef.workspace = true
 inspect.workspace = true
 user_driver.workspace = true
 virt.workspace = true
+underhill_mem.workspace = true
+memory_range.workspace = true
 
 anyhow.workspace = true
 

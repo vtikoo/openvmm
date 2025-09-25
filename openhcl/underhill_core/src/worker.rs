@@ -1505,6 +1505,7 @@ async fn new_underhill_vm(
             .vtom_offset_bit
             .map(|bit| 1 << bit)
             .unwrap_or(0),
+        isolation,
     )
     .context("failed to create global dma manager")?;
 
@@ -2701,8 +2702,8 @@ async fn new_underhill_vm(
                     dma_manager
                         .new_client(DmaClientParameters {
                             device_name: format!("vpci-{instance_id}"),
-                            lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
-                            allocation_visibility: AllocationVisibility::Private,
+                            lower_vtl_policy: LowerVtlPermissionPolicy::Any,
+                            allocation_visibility: AllocationVisibility::Shared,
                             persistent_allocations: false,
                         })?
                         .as_ref(),

@@ -415,7 +415,7 @@ mod ioctls {
     }
 
     #[repr(C, packed)]
-    #[derive(Copy, Clone)]
+    #[derive(Copy, Clone, Debug)]
     pub struct mshv_rmpadjust {
         /// Execute the rmpadjust instruction on the set of memory pages specified
         pub start_pfn: ::std::os::raw::c_ulonglong,

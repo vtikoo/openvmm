@@ -98,6 +98,14 @@ open_enum! {
         DELETE_INTERRUPT2 = 0x42490018,
         /// Bus relations information (version 2)
         BUS_RELATIONS2 = 0x42490019,
+        /// Assigned resources notification (version 3)
+        ASSIGNED_RESOURCES3 = 0x4249001A,
+        /// Create an interrupt for a device (version 3)
+        CREATE_INTERRUPT3 = 0x4249001B,
+        /// Reset a device
+        RESET_DEVICE = 0x4249001C,
+        /// TDISP command from guest to host
+        VPCI_TDISP_COMMAND = 0x4249001D,
     }
 }
 
@@ -367,6 +375,24 @@ pub struct FdoD0Entry {
     pub padding: u32,
     /// Base MMIO address for the device
     pub mmio_start: u64,
+}
+
+/// A TDISP packet being sent to the host.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct VpciTdispCommandHeader {
+    /// Type of message (must be VPCI_TDISP_COMMAND)
+    pub message_type: MessageType,
+    /// PCI slot number of the target device
+    pub slot: SlotNumber,
+    pub data_length: u64,
+    // pub data: [u8; data_length...],
+}
+
+#[derive(Debug, Clone)]
+pub struct VpciTdispCommand {
+    pub header: VpciTdispCommandHeader,
+    pub data: Vec<u8>,
 }
 
 /// Descriptor for a device resource.

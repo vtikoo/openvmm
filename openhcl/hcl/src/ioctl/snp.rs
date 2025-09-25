@@ -110,21 +110,59 @@ impl MshvVtl {
             return Ok(());
         }
 
+        let data = mshv_rmpadjust {
+            start_pfn: range.start() / HV_PAGE_SIZE,
+            page_count: (range.end() - range.start()) / HV_PAGE_SIZE,
+            value: value.into(),
+            terminate_on_failure: terminate_on_failure as u8,
+            ram: 0,
+            padding: Default::default(),
+        };
+
         #[expect(clippy::undocumented_unsafe_blocks)] // TODO SNP
         let ret = unsafe {
-            hcl_rmpadjust_pages(
-                self.file.as_raw_fd(),
-                &mshv_rmpadjust {
-                    start_pfn: range.start() / HV_PAGE_SIZE,
-                    page_count: (range.end() - range.start()) / HV_PAGE_SIZE,
-                    value: value.into(),
-                    terminate_on_failure: terminate_on_failure as u8,
-                    ram: 0,
-                    padding: Default::default(),
-                },
-            )
-            .map_err(SnpError::Os)
-            .map_err(SnpPageError::Rmpadjust)?
+            hcl_rmpadjust_pages(self.file.as_raw_fd(), &data)
+                .map_err(SnpError::Os)
+                .map_err(SnpPageError::Rmpadjust)?
+        };
+
+        if ret != 0 {
+            return Err(SnpPageError::Rmpadjust(SnpError::Isa(ret as u32)));
+        }
+
+        Ok(())
+    }
+
+    /// Execute the rmpadjust instruction on the specified memory range.
+    ///
+    /// The range may be mapped in the kernel as RAM.
+    //
+    // TODO SNP: figure out a safer model for this here and in the kernel.
+    pub fn rmpadjust_pages_ram(
+        &self,
+        range: MemoryRange,
+        value: SevRmpAdjust,
+        terminate_on_failure: bool,
+    ) -> Result<(), SnpPageError> {
+        if value.vmsa() {
+            // TODO SNP: VMSA conversion does not work.
+            return Ok(());
+        }
+
+        let data = mshv_rmpadjust {
+            start_pfn: range.start() / HV_PAGE_SIZE,
+            page_count: (range.end() - range.start()) / HV_PAGE_SIZE,
+            value: value.into(),
+            terminate_on_failure: terminate_on_failure as u8,
+            ram: 1,
+            padding: Default::default(),
+        };
+
+        #[expect(clippy::undocumented_unsafe_blocks)] // TODO SNP
+        let ret = unsafe {
+            hcl_rmpadjust_pages(self.file.as_raw_fd(), &data)
+                .map_err(SnpError::Os)
+                .map_err(SnpPageError::Rmpadjust)?
         };
 
         if ret != 0 {

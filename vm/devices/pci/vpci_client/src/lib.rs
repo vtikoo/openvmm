@@ -11,13 +11,30 @@ use inspect::Inspect;
 use inspect::InspectMut;
 use mesh::rpc::FailableRpc;
 use mesh::rpc::RpcSend;
+use openhcl_tdisp_resources::ClientDevice;
+use openhcl_tdisp_resources::VpciTdispInterface;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
 use parking_lot::Mutex;
 use pci_core::spec::cfg_space::Command;
 use pci_core::spec::cfg_space::HeaderType00;
 use pci_core::spec::hwid::HardwareIds;
+use std::result;
 use std::sync::Arc;
+use tdisp::GuestToHostCommand;
+use tdisp::GuestToHostResponse;
+use tdisp::TdispCommandId;
+use tdisp::TdispCommandResponsePayload;
+use tdisp::TdispDeviceReportType;
+use tdisp::TdispGuestOperationError;
+use tdisp::TdispGuestUnbindReason;
+use tdisp::TdispTdiReport;
+use tdisp::TdispUnbindReason;
+use tdisp::command::TdispCommandRequestGetTdiReport;
+use tdisp::command::TdispCommandRequestPayload;
+use tdisp::command::TdispCommandRequestUnbind;
+use tdisp::devicereport::TdiReportStruct;
+use tdisp::serialize::SerializePacket;
 use vmbus_async::queue::IncomingPacket;
 use vmbus_async::queue::OutgoingPacket;
 use vmbus_async::queue::Queue;
@@ -34,7 +51,6 @@ use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
 use zerocopy::Unalign;
-
 pub struct VpciClient {
     req: mesh::Sender<WorkerRequest>,
     task: Task<()>,
@@ -52,6 +68,7 @@ enum WorkerRequest {
     UnmapInterrupt(FailableRpc<protocol::DeleteInterrupt, ()>),
     QueryResourceRequirements(FailableRpc<SlotNumber, protocol::QueryResourceRequirementsReply>),
     Init(FailableRpc<SlotNumber, ()>),
+    TdispCommand(FailableRpc<protocol::VpciTdispCommand, GuestToHostResponse>),
 }
 
 #[derive(Inspect)]
@@ -137,6 +154,11 @@ pub struct VpciDeviceDescription {
 }
 
 #[derive(Inspect)]
+pub struct VpciDeviceAttestationState {
+    pub has_attested: bool,
+}
+
+#[derive(Inspect)]
 pub struct VpciDevice {
     #[inspect(flatten)]
     desc: VpciDeviceDescription,
@@ -145,6 +167,9 @@ pub struct VpciDevice {
     bar_masks: [u32; 6],
     #[inspect(hex, iter_by_index)]
     bar_rao: [u32; 6],
+
+    // [TDISP TODO] Remove this once the TDISP interface is stable.
+    pub attestation_state: Mutex<VpciDeviceAttestationState>,
 }
 
 #[derive(Inspect)]
@@ -235,6 +260,9 @@ impl VpciDeviceDescription {
             }),
             bar_masks: requirements.bars,
             bar_rao,
+            attestation_state: Mutex::new(VpciDeviceAttestationState {
+                has_attested: false,
+            }),
         };
 
         Ok(device)
@@ -318,6 +346,27 @@ impl VpciDevice {
         }
         accessor.write(self.desc.slot, offset, value);
     }
+
+    pub fn configured_bars(&self) -> [u32; 6] {
+        let shadows = self.shadows.lock();
+
+        let mut bars = [0; 6];
+        for (i, &bar) in shadows.bars.iter().enumerate() {
+            bars[i] = bar;
+        }
+
+        bars
+    }
+
+    pub fn set_attested(&self, attested: bool) {
+        let mut locked = self.attestation_state.lock();
+        locked.has_attested = attested;
+    }
+
+    pub fn has_attested(&self) -> bool {
+        let locked = self.attestation_state.lock();
+        locked.has_attested
+    }
 }
 
 impl MapVpciInterrupt for VpciDevice {
@@ -387,12 +436,186 @@ impl MapVpciInterrupt for VpciDevice {
             .req
             .call_failable(WorkerRequest::UnmapInterrupt, resource)
             .await
-            .unwrap_or_else(|err| {
+            .unwrap_or_else(|err: mesh::rpc::RpcError<mesh::error::RemoteError>| {
                 tracing::error!(
                     error = &err as &dyn std::error::Error,
                     "failed to unregister interrupt"
                 );
             });
+    }
+}
+
+impl VpciTdispInterface for VpciDevice {
+    async fn send_tdisp_command(
+        &self,
+        payload: GuestToHostCommand,
+    ) -> Result<GuestToHostResponse, anyhow::Error> {
+        let serialized = payload.serialize_to_bytes();
+        // [TDISP TODO] Validate the payload length.
+        let res = self
+            .desc
+            .req
+            .call_failable(
+                WorkerRequest::TdispCommand,
+                protocol::VpciTdispCommand {
+                    header: protocol::VpciTdispCommandHeader {
+                        message_type: protocol::MessageType::VPCI_TDISP_COMMAND,
+                        slot: self.desc.slot,
+                        data_length: serialized.len() as u64,
+                    },
+                    data: serialized,
+                },
+            )
+            .await
+            .map_err(|err: mesh::rpc::RpcError<mesh::error::RemoteError>| {
+                tracing::error!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to send tdisp command"
+                );
+                anyhow::anyhow!("failed to send tdisp command")
+            })?;
+
+        match res.result {
+            TdispGuestOperationError::Success => Ok(res),
+            _ => {
+                let err_msg = format!(
+                    "send_tdisp_command {:?} failed because host responded with an error: {:?}",
+                    payload.command_id, res.result
+                );
+
+                tracing::error!(msg = err_msg);
+                Err(anyhow::anyhow!(err_msg))
+            }
+        }
+    }
+
+    async fn tdisp_get_device_interface_info(
+        &self,
+    ) -> anyhow::Result<tdisp::TdispDeviceInterfaceInfo> {
+        let res = self
+            .send_tdisp_command(GuestToHostCommand {
+                device_id: self.desc.slot.into_bits() as u64,
+                command_id: TdispCommandId::GetDeviceInterfaceInfo,
+                payload: TdispCommandRequestPayload::None,
+            })
+            .await;
+
+        match res {
+            Ok(resp) => match resp.payload {
+                TdispCommandResponsePayload::GetDeviceInterfaceInfo(info) => Ok(info),
+                _ => Err(anyhow::anyhow!("unexpected response payload")),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn tdisp_bind_interface(&self) -> anyhow::Result<()> {
+        let res = self
+            .send_tdisp_command(GuestToHostCommand {
+                device_id: self.desc.slot.into_bits() as u64,
+                command_id: TdispCommandId::Bind,
+                payload: TdispCommandRequestPayload::None,
+            })
+            .await;
+        match res {
+            Ok(resp) => match resp.payload {
+                TdispCommandResponsePayload::None => Ok(()),
+                _ => Err(anyhow::anyhow!("unexpected response payload")),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn tdisp_start_device(&self) -> anyhow::Result<()> {
+        let res = self
+            .send_tdisp_command(GuestToHostCommand {
+                device_id: self.desc.slot.into_bits() as u64,
+                command_id: TdispCommandId::StartTdi,
+                payload: TdispCommandRequestPayload::None,
+            })
+            .await;
+        match res {
+            Ok(resp) => match resp.payload {
+                TdispCommandResponsePayload::None => Ok(()),
+                _ => Err(anyhow::anyhow!("unexpected response payload")),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn tdisp_get_device_report(
+        &self,
+        report_type: &TdispDeviceReportType,
+    ) -> anyhow::Result<Vec<u8>> {
+        let res = self
+            .send_tdisp_command(GuestToHostCommand {
+                device_id: self.desc.slot.into_bits() as u64,
+                command_id: TdispCommandId::GetTdiReport,
+                payload: TdispCommandRequestPayload::GetTdiReport(
+                    TdispCommandRequestGetTdiReport {
+                        report_type: report_type.into(),
+                    },
+                ),
+            })
+            .await;
+
+        match res {
+            Ok(resp) => match resp.payload {
+                TdispCommandResponsePayload::GetTdiReport(resp) => Ok(resp.report_buffer),
+                _ => Err(anyhow::anyhow!("unexpected response payload")),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn tdisp_get_tdi_report(&self) -> anyhow::Result<TdiReportStruct> {
+        let res = self
+            .tdisp_get_device_report(&TdispDeviceReportType::TdiReport(
+                TdispTdiReport::TdiInfoInterfaceReport,
+            ))
+            .await;
+
+        let buffer = res.context("failed to get TDI report")?;
+        tdisp::devicereport::deserialize_tdi_report(&buffer)
+            .context("failed to deserialize TDI report from host")
+    }
+
+    async fn tdisp_get_tdi_device_id(&self) -> anyhow::Result<u64> {
+        let res = self
+            .tdisp_get_device_report(&TdispDeviceReportType::TdiReport(
+                TdispTdiReport::TdiInfoGuestDeviceId,
+            ))
+            .await;
+
+        let buffer = res.context("failed to get TDI report")?;
+
+        // Ensure it's a u64
+        if buffer.len() != size_of::<u64>() {
+            return Err(anyhow::anyhow!("unexpected buffer size for TDI device ID"));
+        }
+
+        // Convert to u64
+        Ok(u64::from_le_bytes(buffer.try_into().unwrap()))
+    }
+
+    /// Request to unbind the device and return to the Unlocked state.
+    async fn tdisp_unbind(&self, reason: TdispGuestUnbindReason) -> anyhow::Result<()> {
+        let res = self
+            .send_tdisp_command(GuestToHostCommand {
+                device_id: self.desc.slot.into_bits() as u64,
+                command_id: TdispCommandId::Unbind,
+                payload: TdispCommandRequestPayload::Unbind(TdispCommandRequestUnbind {
+                    unbind_reason: reason.into(),
+                }),
+            })
+            .await;
+        match res {
+            Ok(resp) => match resp.payload {
+                TdispCommandResponsePayload::None => Ok(()),
+                _ => Err(anyhow::anyhow!("unexpected response payload")),
+            },
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -420,6 +643,7 @@ enum Tx {
         #[inspect(skip)] FailableRpc<(), protocol::QueryResourceRequirementsReply>,
     ),
     AssignedResources(#[inspect(skip)] FailableRpc<(), ()>),
+    TdispCommand(#[inspect(skip)] FailableRpc<(), GuestToHostResponse>),
 }
 
 impl VpciClient {
@@ -447,6 +671,7 @@ impl VpciClient {
         // Start a transaction to move the bus to the D0 state. The completion
         // may come after the device list, so start the task and wait for the
         // reply afterwards.
+
         let (fdo_entry_send, fdo_entry_recv) = mesh::oneshot();
         let tx_id = index_to_tx_id(tx.insert(Tx::FdoD0Entry(fdo_entry_send)));
         conn.queue
@@ -592,6 +817,7 @@ impl<M: RingMem> VpciClientWorker<M> {
                             }
                             IncomingPacket::Completion(p) => {
                                 let tx_id = p.transaction_id();
+
                                 let entry = self
                                     .tx
                                     .try_remove(tx_id_to_index(tx_id))
@@ -603,6 +829,40 @@ impl<M: RingMem> VpciClientWorker<M> {
                                     .context("failed to read tx reply")?;
 
                                 match entry {
+                                    Tx::TdispCommand(rpc) => {
+                                        if status == protocol::Status::SUCCESS {
+                                            let mut reader = p.reader();
+
+                                            let header = reader
+                                                .read_plain::<protocol::VpciTdispCommandHeader>()
+                                                .context("failed to read tdisp command header")?;
+
+                                            let data_len = header.data_length as usize;
+
+                                            // Allocate a mutable vector with the correct size
+                                            let mut data: Vec<u8> = vec![0; data_len];
+
+                                            // Read data_len bytes from start_of_data into Vec
+                                            reader
+                                                .read(data.as_mut_slice())
+                                                .context("failed to read tdisp command data")?;
+
+                                            let host_response =
+                                                GuestToHostResponse::deserialize_from_bytes(
+                                                    data.as_slice(),
+                                                )
+                                                .context("failed to deserialize tdisp response");
+
+                                            rpc.complete(
+                                                host_response
+                                                    .map_err(mesh::error::RemoteError::new),
+                                            );
+                                        } else {
+                                            rpc.fail(anyhow::anyhow!(
+                                                "failed to send tdisp command: {status:#x?}",
+                                            ));
+                                        }
+                                    }
                                     Tx::FdoD0Entry(send) => {
                                         tracing::trace!(
                                             tx_id,
@@ -693,6 +953,12 @@ impl<M: RingMem> VpciClientWorker<M> {
 
     async fn handle_req(&mut self, req: WorkerRequest) -> anyhow::Result<()> {
         match req {
+            WorkerRequest::TdispCommand(rpc) => {
+                let (req, reply) = rpc.split();
+                self.send_tx(Tx::TdispCommand(reply), req.header, req.data.as_slice())
+                    .await
+                    .context("failed to send tdisp command message")?;
+            }
             WorkerRequest::Inspect(deferred) => deferred.inspect(&mut *self),
             WorkerRequest::MapInterrupt(rpc) => {
                 let (req, reply) = rpc.split();
@@ -746,11 +1012,6 @@ impl<M: RingMem> VpciClientWorker<M> {
     ) -> anyhow::Result<()> {
         let entry = self.tx.vacant_entry();
         let tx_id = index_to_tx_id(entry.key());
-        tracing::trace!(
-            tx_id,
-            message = std::any::type_name_of_val(&msg),
-            "sending transaction"
-        );
 
         self.conn
             .queue

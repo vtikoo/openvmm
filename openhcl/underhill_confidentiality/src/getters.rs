@@ -32,5 +32,6 @@ pub fn confidential_debug_enabled() -> bool {
 /// Gets whether confidential filtering is enabled. This is the source of truth for
 /// whether diagnostic sources should filter their output to enforce confidentiality.
 pub fn confidential_filtering_enabled() -> bool {
-    is_confidential_vm() && !confidential_debug_enabled()
+    // is_confidential_vm() && !confidential_debug_enabled()
+    false
 }

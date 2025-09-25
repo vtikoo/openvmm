@@ -42,8 +42,9 @@ pub async fn open_channel(
     input: Input,
     dma_client: &dyn DmaClient,
 ) -> anyhow::Result<RawAsyncChannel<MemoryBlockRingMem>> {
-    let gpadl =
-        dma_client.allocate_dma_buffer(vmbus_ring::PAGE_SIZE * input.ring_pages as usize)?;
+    let gpadl = dma_client
+        .allocate_dma_buffer(vmbus_ring::PAGE_SIZE * input.ring_pages as usize)
+        .context("failed to allocate gpadl memory")?;
 
     let (resp_send, resp_recv) = mesh::oneshot();
     // Detach the task so that it doesn't get dropped (and thereby leak the allocation).

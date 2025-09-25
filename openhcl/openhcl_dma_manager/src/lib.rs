@@ -19,6 +19,7 @@ use page_pool_alloc::PagePoolAllocatorSpawner;
 use std::sync::Arc;
 use user_driver::DmaClient;
 use user_driver::lockmem::LockedMemorySpawner;
+use virt::IsolationType;
 
 /// Save restore support for [`OpenhclDmaManager`].
 pub mod save_restore {
@@ -119,6 +120,7 @@ pub struct OpenhclDmaManager {
     private_pool: Option<PagePool>,
     #[inspect(skip)]
     inner: Arc<DmaManagerInner>,
+    isolation_type: IsolationType,
 }
 
 /// The required VTL permissions on DMA allocations.
@@ -189,7 +191,11 @@ impl virt::VtlMemoryProtection for DmaManagerLowerVtl {
 }
 
 impl DmaManagerInner {
-    fn new_dma_client(&self, params: DmaClientParameters) -> anyhow::Result<Arc<OpenhclDmaClient>> {
+    fn new_dma_client(
+        &self,
+        params: DmaClientParameters,
+        isolation_type: IsolationType,
+    ) -> anyhow::Result<Arc<OpenhclDmaClient>> {
         // Allocate the inner client that actually performs the allocations.
         let backing = {
             let DmaClientParameters {
@@ -255,6 +261,9 @@ impl DmaManagerInner {
                         )
                     }
                     LowerVtlPermissionPolicy::Vtl0 => {
+                        tracing::error!(
+                            "------------- [[[Private]]] LowerVtlPermissionPolicy::Vtl0 Path!!!"
+                        );
                         // Private memory must be wrapped in a lower VTL memory
                         // spawner, as otherwise it is accessible to VTL2 only.
                         DmaClientBacking::PrivatePoolLowerVtl(LowerVtlMemorySpawner::new(
@@ -262,6 +271,7 @@ impl DmaManagerInner {
                                 .allocator(device_name.into())
                                 .context("failed to create private allocator")?,
                             self.lower_vtl.clone(),
+                            isolation_type,
                         ))
                     }
                 },
@@ -286,11 +296,13 @@ impl DmaManagerInner {
                         DmaClientBacking::LockedMemory(LockedMemorySpawner)
                     }
                     LowerVtlPermissionPolicy::Vtl0 => {
+                        tracing::error!("------------- LowerVtlPermissionPolicy::Vtl0 Path!!!");
                         // `LockedMemorySpawner` uses private VTL2 ram, so
                         // lowering VTL permissions is required.
                         DmaClientBacking::LockedMemoryLowerVtl(LowerVtlMemorySpawner::new(
                             LockedMemorySpawner,
                             self.lower_vtl.clone(),
+                            isolation_type,
                         ))
                     }
                 },
@@ -308,6 +320,7 @@ impl OpenhclDmaManager {
         shared_ranges: &[MemoryRange],
         private_ranges: &[MemoryRange],
         vtom: u64,
+        isolation_type: IsolationType,
     ) -> anyhow::Result<Self> {
         let shared_pool = if shared_ranges.is_empty() {
             None
@@ -341,19 +354,21 @@ impl OpenhclDmaManager {
             }),
             shared_pool,
             private_pool,
+            isolation_type,
         })
     }
 
     /// Creates a new DMA client with the given device name and lower VTL
     /// policy.
     pub fn new_client(&self, params: DmaClientParameters) -> anyhow::Result<Arc<OpenhclDmaClient>> {
-        self.inner.new_dma_client(params)
+        self.inner.new_dma_client(params, self.isolation_type)
     }
 
     /// Returns a [`DmaClientSpawner`] for creating DMA clients.
     pub fn client_spawner(&self) -> DmaClientSpawner {
         DmaClientSpawner {
             inner: self.inner.clone(),
+            isolation_type: self.isolation_type,
         }
     }
 
@@ -381,12 +396,13 @@ impl OpenhclDmaManager {
 #[derive(Clone)]
 pub struct DmaClientSpawner {
     inner: Arc<DmaManagerInner>,
+    isolation_type: IsolationType,
 }
 
 impl DmaClientSpawner {
     /// Creates a new DMA client with the given parameters.
     pub fn new_client(&self, params: DmaClientParameters) -> anyhow::Result<Arc<OpenhclDmaClient>> {
-        self.inner.new_dma_client(params)
+        self.inner.new_dma_client(params, self.isolation_type)
     }
 }
 

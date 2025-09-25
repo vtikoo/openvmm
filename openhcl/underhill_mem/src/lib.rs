@@ -121,7 +121,7 @@ impl GpaVtlPermissions {
             IsolationType::Vbs => GpaVtlPermissions::Vbs(protections),
             IsolationType::Snp => {
                 let mut vtl_permissions = GpaVtlPermissions::Snp(SevRmpAdjust::new());
-                vtl_permissions.set(vtl, protections);
+                vtl_permissions.set(vtl.into(), protections);
                 vtl_permissions
             }
             IsolationType::Tdx => {
@@ -129,13 +129,33 @@ impl GpaVtlPermissions {
                     TdgMemPageGpaAttr::new(),
                     TdgMemPageAttrWriteR8::new(),
                 ));
-                vtl_permissions.set(vtl, protections);
+                vtl_permissions.set(vtl.into(), protections);
                 vtl_permissions
             }
         }
     }
 
-    fn set(&mut self, vtl: GuestVtl, protections: HvMapGpaFlags) {
+    /// Explicitly set the pages back to VTL2 protections.
+    fn new_vtl2_permissions(isolation_type: IsolationType, protections: HvMapGpaFlags) -> Self {
+        match isolation_type {
+            IsolationType::None | IsolationType::Vbs => GpaVtlPermissions::Vbs(protections),
+            IsolationType::Snp => {
+                let mut vtl_permissions = GpaVtlPermissions::Snp(SevRmpAdjust::new());
+                vtl_permissions.set(Vtl::Vtl2, protections);
+                vtl_permissions
+            }
+            IsolationType::Tdx => {
+                let mut vtl_permissions = GpaVtlPermissions::Tdx((
+                    TdgMemPageGpaAttr::new(),
+                    TdgMemPageAttrWriteR8::new(),
+                ));
+                vtl_permissions.set(Vtl::Vtl2, protections);
+                vtl_permissions
+            }
+        }
+    }
+
+    fn set(&mut self, vtl: Vtl, protections: HvMapGpaFlags) {
         match self {
             GpaVtlPermissions::Vbs(flags) => *flags = protections,
             GpaVtlPermissions::Snp(rmpadjust) => {
@@ -145,8 +165,9 @@ impl GpaVtlPermissions {
                     .with_enable_user_execute(protections.user_executable())
                     .with_enable_kernel_execute(protections.kernel_executable())
                     .with_target_vmpl(match vtl {
-                        GuestVtl::Vtl0 => x86defs::snp::Vmpl::Vmpl2.into(),
-                        GuestVtl::Vtl1 => x86defs::snp::Vmpl::Vmpl1.into(),
+                        Vtl::Vtl0 => x86defs::snp::Vmpl::Vmpl2.into(),
+                        Vtl::Vtl1 => x86defs::snp::Vmpl::Vmpl1.into(),
+                        Vtl::Vtl2 => x86defs::snp::Vmpl::Vmpl3.into(),
                     });
             }
             GpaVtlPermissions::Tdx((attributes, mask)) => {
@@ -158,16 +179,22 @@ impl GpaVtlPermissions {
                     .with_user_execute(protections.user_executable());
 
                 let (new_attributes, new_mask) = match vtl {
-                    GuestVtl::Vtl0 => {
+                    Vtl::Vtl0 => {
                         let attributes = TdgMemPageGpaAttr::new().with_l2_vm1(vm_attributes);
                         let mask = TdgMemPageAttrWriteR8::new()
                             .with_l2_vm1(GpaVmAttributesMask::ALL_CHANGED);
                         (attributes, mask)
                     }
-                    GuestVtl::Vtl1 => {
+                    Vtl::Vtl1 => {
                         let attributes = TdgMemPageGpaAttr::new().with_l2_vm2(vm_attributes);
                         let mask = TdgMemPageAttrWriteR8::new()
                             .with_l2_vm2(GpaVmAttributesMask::ALL_CHANGED);
+                        (attributes, mask)
+                    }
+                    Vtl::Vtl2 => {
+                        let attributes = TdgMemPageGpaAttr::new().with_l2_vm3(vm_attributes);
+                        let mask = TdgMemPageAttrWriteR8::new()
+                            .with_l2_vm3(GpaVmAttributesMask::ALL_CHANGED);
                         (attributes, mask)
                     }
                 };
@@ -286,7 +313,7 @@ impl MemoryAcceptor {
     }
 
     /// Query the current permissions for a vtl on a page.
-    fn vtl_permissions(
+    pub fn vtl_permissions(
         &self,
         vtl: Vtl,
         gpa: u64,
@@ -312,6 +339,7 @@ impl MemoryAcceptor {
         }
     }
 
+    /// Apply VTL protections to the given range.
     fn apply_protections_from_flags(
         &self,
         range: MemoryRange,
@@ -319,7 +347,27 @@ impl MemoryAcceptor {
         flags: HvMapGpaFlags,
     ) -> Result<(), ApplyVtlProtectionsError> {
         let permissions = GpaVtlPermissions::new(self.isolation, vtl, flags);
-        self.apply_protections(range, vtl.into(), permissions)
+        self.apply_protections(range, vtl.into(), permissions, false)
+    }
+
+    /// Apply VTL protections to make pages visible to VTL0.
+    pub fn apply_protections_for_vtl0(
+        &self,
+        range: MemoryRange,
+        flags: HvMapGpaFlags,
+    ) -> Result<(), ApplyVtlProtectionsError> {
+        let permissions = GpaVtlPermissions::new(self.isolation, GuestVtl::Vtl0, flags);
+        self.apply_protections(range, Vtl::Vtl0, permissions, true)
+    }
+
+    /// Apply VTL protections to make pages visible to VTL2.
+    pub fn apply_protections_for_vtl2(
+        &self,
+        range: MemoryRange,
+        flags: HvMapGpaFlags,
+    ) -> Result<(), ApplyVtlProtectionsError> {
+        let permissions = GpaVtlPermissions::new_vtl2_permissions(self.isolation, flags);
+        self.apply_protections(range, Vtl::Vtl2, permissions, true)
     }
 
     fn apply_protections(
@@ -327,6 +375,7 @@ impl MemoryAcceptor {
         range: MemoryRange,
         vtl: Vtl,
         protections: GpaVtlPermissions,
+        ram: bool,
     ) -> Result<(), ApplyVtlProtectionsError> {
         match protections {
             GpaVtlPermissions::Vbs(flags) => {
@@ -340,15 +389,27 @@ impl MemoryAcceptor {
             GpaVtlPermissions::Snp(rmpadjust) => {
                 // For SNP VMs, the permissions apply to the specified VTL.
                 // Therefore VTL 2 cannot specify its own permissions.
-                assert_ne!(vtl, Vtl::Vtl2);
-                self.mshv_vtl
-                    .rmpadjust_pages(range, rmpadjust, false)
-                    .map_err(|err| ApplyVtlProtectionsError::Snp {
-                        failed_operation: err,
-                        range,
-                        permissions: rmpadjust,
-                        vtl: vtl.into(),
-                    })
+                // [TDISP TODO] Allow pages to be adjusted back to VTL2 pages.
+                //assert_ne!(vtl, Vtl::Vtl2);
+                if ram {
+                    self.mshv_vtl
+                        .rmpadjust_pages_ram(range, rmpadjust, false)
+                        .map_err(|err| ApplyVtlProtectionsError::Snp {
+                            failed_operation: err,
+                            range,
+                            permissions: rmpadjust,
+                            vtl: vtl.into(),
+                        })
+                } else {
+                    self.mshv_vtl
+                        .rmpadjust_pages(range, rmpadjust, false)
+                        .map_err(|err| ApplyVtlProtectionsError::Snp {
+                            failed_operation: err,
+                            range,
+                            permissions: rmpadjust,
+                            vtl: vtl.into(),
+                        })
+                }
             }
             GpaVtlPermissions::Tdx((attributes, mask)) => {
                 // For TDX VMs, the permissions apply to the specified VTL.
@@ -428,7 +489,7 @@ impl HardwareIsolatedMemoryProtector {
         for range in ranges {
             match overlay_lock.as_mut() {
                 Some(overlay) if range.contains_addr(overlay.gpn * HV_PAGE_SIZE) => {
-                    overlay.permissions.set(vtl, protections);
+                    overlay.permissions.set(vtl.into(), protections);
 
                     let overlay_address = overlay.gpn * HV_PAGE_SIZE;
                     let overlay_offset = range.offset_of(overlay_address).unwrap();
@@ -460,7 +521,7 @@ impl HardwareIsolatedMemoryProtector {
         let range = MemoryRange::new(overlay.gpn * HV_PAGE_SIZE..(overlay.gpn + 1) * HV_PAGE_SIZE);
 
         self.acceptor
-            .apply_protections(range, vtl.into(), overlay.permissions)?;
+            .apply_protections(range, vtl.into(), overlay.permissions, false)?;
 
         Ok(())
     }
