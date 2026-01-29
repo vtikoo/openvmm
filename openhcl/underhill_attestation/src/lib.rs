@@ -14,6 +14,8 @@ mod hardware_key_sealing;
 mod igvm_attest;
 mod key_protector;
 mod secure_key_release;
+/// TDISP (TEE Device Interface Security Protocol) attestation and verification
+pub mod tdisp;
 mod vmgs;
 
 pub use igvm_attest::Error as IgvmAttestError;

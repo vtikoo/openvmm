@@ -155,7 +155,8 @@ pub struct VpciDeviceDescription {
 
 #[derive(Inspect)]
 pub struct VpciDeviceAttestationState {
-    pub has_attested: bool,
+    pub attestation_passed: bool,
+    pub mmio_setup_done: bool,
 }
 
 #[derive(Inspect)]
@@ -261,7 +262,8 @@ impl VpciDeviceDescription {
             bar_masks: requirements.bars,
             bar_rao,
             attestation_state: Mutex::new(VpciDeviceAttestationState {
-                has_attested: false,
+                attestation_passed: false,
+                mmio_setup_done: false,
             }),
         };
 
@@ -358,14 +360,32 @@ impl VpciDevice {
         bars
     }
 
-    pub fn set_attested(&self, attested: bool) {
-        let mut locked = self.attestation_state.lock();
-        locked.has_attested = attested;
+    pub fn vendor_id(&self) -> u16 {
+        self.desc.hw_ids.vendor_id
     }
 
-    pub fn has_attested(&self) -> bool {
+    pub fn device_id(&self) -> u16 {
+        self.desc.hw_ids.device_id
+    }
+
+    pub fn set_attestation_passed(&self, passed: bool) {
+        let mut locked = self.attestation_state.lock();
+        locked.attestation_passed = passed;
+    }
+
+    pub fn attestation_passed(&self) -> bool {
         let locked = self.attestation_state.lock();
-        locked.has_attested
+        locked.attestation_passed
+    }
+
+    pub fn mmio_setup_done(&self) -> bool {
+        let locked = self.attestation_state.lock();
+        locked.mmio_setup_done
+    }
+
+    pub fn set_mmio_setup_done(&self) {
+        let mut locked = self.attestation_state.lock();
+        locked.mmio_setup_done = true;
     }
 }
 

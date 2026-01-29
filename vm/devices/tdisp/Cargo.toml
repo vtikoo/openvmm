@@ -15,6 +15,8 @@ zerocopy.workspace = true
 parking_lot.workspace = true
 bitfield-struct.workspace = true
 static_assertions.workspace = true
+hex.workspace = true
+openssl.workspace = true
 
 [lints]
 workspace = true

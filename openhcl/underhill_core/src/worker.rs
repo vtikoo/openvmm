@@ -1189,6 +1189,27 @@ async fn new_underhill_vm(
         bootloader_fdt_parser::IsolationType::Tdx => virt::IsolationType::Tdx,
     };
 
+    // Initialize TDISP verifier from VTL2 settings early so it's available for device attestation
+    let tdisp_verifier = {
+        let tdisp_device_rims = dps
+            .general
+            .vtl2_settings
+            .as_ref()
+            .and_then(|settings| settings.fixed.tdisp_device_rims.as_ref());
+
+        match underhill_attestation::tdisp::init_tdisp_verifier_from_settings(tdisp_device_rims) {
+            Ok(verifier) => Some(Arc::new(verifier)),
+            Err(e) => {
+                tracing::error!(
+                    error = format!("{:#}", e),
+                    "Failed to initialize TDISP verifier from VTL2 settings"
+                );
+                // Continue without TDISP verifier - attestation will fail if attempted
+                None
+            }
+        }
+    };
+
     let hardware_isolated = isolation.is_hardware_isolated();
 
     let driver_source = VmTaskDriverSource::new(ThreadpoolBackend::new(tp.clone()));
@@ -2708,6 +2729,7 @@ async fn new_underhill_vm(
                         })?
                         .as_ref(),
                     vmbus.control(),
+                    tdisp_verifier.as_ref(),
                 )
                 .await?;
             }
@@ -3054,6 +3076,7 @@ async fn new_underhill_vm(
         nvme_keep_alive: env_cfg.nvme_keep_alive,
         test_configuration: env_cfg.test_configuration,
         dma_manager,
+        tdisp_verifier: tdisp_verifier.and_then(|v| Arc::try_unwrap(v).ok()),
     };
 
     Ok(loaded_vm)

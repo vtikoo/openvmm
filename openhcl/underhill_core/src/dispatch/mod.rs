@@ -184,6 +184,9 @@ pub(crate) struct LoadedVm {
     pub nvme_keep_alive: bool,
     pub test_configuration: Option<TestScenarioConfig>,
     pub dma_manager: OpenhclDmaManager,
+    
+    /// TDISP verifier for device attestation
+    pub tdisp_verifier: Option<underhill_attestation::tdisp::TdispVerifier<'static>>,
 }
 
 pub struct LoadedVmState<T> {

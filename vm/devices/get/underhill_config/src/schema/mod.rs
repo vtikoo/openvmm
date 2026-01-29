@@ -8,6 +8,7 @@
 use self::v1::NAMESPACE_BASE;
 use self::v1::NAMESPACE_NETWORK_ACCELERATION;
 use self::v1::NAMESPACE_NETWORK_DEVICE;
+use self::v1::NAMESPACE_TDISP_DEVICE_RIMS;
 use crate::Vtl2SettingsErrorInfoVec;
 use crate::errors::ParseErrors;
 use crate::errors::ParseErrorsBase;
@@ -42,6 +43,26 @@ impl From<ParseError> for ParseErrorInner {
 impl From<ParsingStopped> for ParseErrorInner {
     fn from(value: ParsingStopped) -> Self {
         ParseErrorInner::Validation(value)
+    }
+}
+
+impl From<TdispDeviceRim> for crate::TdispDeviceRim {
+    fn from(rim: TdispDeviceRim) -> crate::TdispDeviceRim {
+        crate::TdispDeviceRim {
+            vendor_id: rim.vendor_id as u16,
+            device_id: rim.device_id as u16,
+            device_name: rim.device_name,
+            auth_rim: rim.auth_rim,
+            trust_rim: rim.trust_rim,
+        }
+    }
+}
+
+impl From<TdispDeviceRims> for crate::TdispDeviceRims {
+    fn from(rims: TdispDeviceRims) -> crate::TdispDeviceRims {
+        crate::TdispDeviceRims {
+            devices: rims.devices.into_iter().map(|d| d.into()).collect(),
+        }
     }
 }
 
@@ -87,6 +108,7 @@ impl crate::Vtl2Settings {
 
         let mut nic_devices: Option<Vec<crate::NicDevice>> = None;
         let mut nic_acceleration: Option<Vec<crate::NicDevice>> = None;
+        let mut tdisp_device_rims: Option<crate::TdispDeviceRims> = None;
 
         for chunk in &decoded.namespace_settings {
             if chunk.settings.is_empty() {
@@ -119,6 +141,13 @@ impl crate::Vtl2Settings {
                             .flat_map(|v| v.parse(errors).collect_error(errors))
                             .collect(),
                     );
+                }
+                NAMESPACE_TDISP_DEVICE_RIMS => {
+                    let raw_bytes = chunk.settings.as_slice();
+                    if !raw_bytes.is_empty() {
+                        let device_rims: TdispDeviceRims = Self::read(raw_bytes)?;
+                        tdisp_device_rims = Some(device_rims.into());
+                    }
                 }
                 _ => {
                     errors.push(v1::Error::UnsupportedSchemaNamespace(
@@ -158,6 +187,11 @@ impl crate::Vtl2Settings {
                     }
                 }
             }
+        }
+
+        // NAMESPACE_TDISP_DEVICE_RIMS
+        if let Some(tdisp_device_rims) = tdisp_device_rims {
+            old_settings.fixed.tdisp_device_rims = Some(tdisp_device_rims);
         }
 
         Ok(old_settings)
@@ -278,6 +312,33 @@ mod test {
         let mut buf = Vec::new();
         settings.encode(&mut buf).unwrap();
         crate::Vtl2Settings::read_from(&buf, Default::default()).unwrap();
+    }
+
+    #[test]
+    fn smoke_test_tdisp_device_rims_namespace() {
+        let settings = crate::Vtl2Settings::read_from(
+            include_bytes!("vtl2s_test_tdisp_device_rims.json"),
+            Default::default(),
+        )
+        .unwrap();
+        let device_rims = settings.fixed.tdisp_device_rims.unwrap();
+        assert_eq!(2, device_rims.devices.len());
+        assert_eq!(5132, device_rims.devices[0].vendor_id);
+        assert_eq!(49155, device_rims.devices[0].device_id);
+        assert_eq!("Manticore Device", device_rims.devices[0].device_name);
+    }
+
+    #[test]
+    fn smoke_test_tdisp_device_rims_namespace_pb() {
+        let json = include_bytes!("vtl2s_test_tdisp_device_rims.json");
+        let settings: Vtl2Settings = crate::Vtl2Settings::read(json).unwrap();
+        assert_eq!("TdispDeviceRims", settings.namespace_settings[0].namespace);
+        let mut buf = Vec::new();
+        settings.encode(&mut buf).unwrap();
+        let settings = crate::Vtl2Settings::read_from(&buf, Default::default()).unwrap();
+        let device_rims = settings.fixed.tdisp_device_rims.unwrap();
+        assert_eq!(2, device_rims.devices.len());
+        assert_eq!(5132, device_rims.devices[0].vendor_id);
     }
 
     #[test]
