@@ -173,6 +173,29 @@ pub struct NicDevice {
     pub max_sub_channels: Option<u16>,
 }
 
+/// Device RIM entry for TDISP attestation
+#[derive(Default, Debug, Clone, Eq, PartialEq, MeshPayload, Inspect)]
+pub struct TdispDeviceRim {
+    /// PCI vendor ID
+    pub vendor_id: u16,
+    /// PCI device ID
+    pub device_id: u16,
+    /// Friendly device name
+    pub device_name: String,
+    /// Base64-encoded CoseSign1 authenticity RIM from THIM
+    pub auth_rim: String,
+    /// Base64-encoded CoseSign1 trust RIM from THIM
+    pub trust_rim: String,
+}
+
+/// Collection of Device RIMs for TDISP attestation
+#[derive(Default, Debug, Clone, Eq, PartialEq, MeshPayload, Inspect)]
+pub struct TdispDeviceRims {
+    /// List of device RIMs
+    #[inspect(iter_by_index)]
+    pub devices: Vec<TdispDeviceRim>,
+}
+
 #[derive(Debug, Clone, MeshPayload, Inspect)]
 pub struct Vtl2SettingsFixed {
     /// number of sub-channels for the SCSI controller
@@ -181,6 +204,8 @@ pub struct Vtl2SettingsFixed {
     pub io_ring_size: u32,
     /// Max bounce buffer pages active per cpu
     pub max_bounce_buffer_pages: Option<u32>,
+    /// TDISP Device RIMs
+    pub tdisp_device_rims: Option<TdispDeviceRims>,
 }
 
 #[derive(Debug, Clone, MeshPayload, Inspect)]

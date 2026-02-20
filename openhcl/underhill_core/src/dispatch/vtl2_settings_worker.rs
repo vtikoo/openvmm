@@ -280,6 +280,16 @@ impl Vtl2SettingsWorker {
         let mut context = CancelContext::new()
             .with_timeout(Duration::from_secs(MODIFY_VTL2_SETTINGS_TIMEOUT_IN_SECONDS));
 
+        // Debug logging for TDISP settings
+        tracing::info!("Received VTL2 settings buffer of {} bytes", buf.len());
+        
+        // Try to interpret as UTF8 string for debugging
+        if let Ok(s) = std::str::from_utf8(buf) {
+            tracing::info!("Buffer as UTF8 string (first 500 chars): {}", &s[..s.len().min(500)]);
+        } else {
+            tracing::warn!("Buffer is not valid UTF8");
+        }
+
         let old_settings = Vtl2Settings {
             fixed: Default::default(),
             dynamic: self.old_settings.clone(),
@@ -287,18 +297,23 @@ impl Vtl2SettingsWorker {
         let vtl2_settings =
             Vtl2Settings::read_from(buf, old_settings).map_err(|err| match err {
                 underhill_config::schema::ParseError::Json(err) => {
+                    tracing::error!("JSON parse error: {}", err);
                     vec![Vtl2SettingsErrorInfo::new(
                         Vtl2SettingsErrorCode::JsonFormatError,
                         err.to_string(),
                     )]
                 }
                 underhill_config::schema::ParseError::Protobuf(err) => {
+                    tracing::error!("Protobuf parse error: {}", err);
                     vec![Vtl2SettingsErrorInfo::new(
                         Vtl2SettingsErrorCode::ProtobufFormatError,
                         err.to_string(),
                     )]
                 }
-                underhill_config::schema::ParseError::Validation(err) => err.errors,
+                underhill_config::schema::ParseError::Validation(err) => {
+                    tracing::error!("Validation error: {:?}", err);
+                    err.errors
+                }
             })?;
 
         let new_settings = vtl2_settings.dynamic;

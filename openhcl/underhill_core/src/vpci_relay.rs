@@ -5,18 +5,12 @@ use chipset_device::pci::PciConfigSpace;
 use futures::StreamExt;
 use hcl::ioctl::Mshv;
 use hcl::ioctl::MshvHvcall;
-use hvdef::HvMapGpaFlags;
 use hvdef::HypercallCode;
 use hvdef::hypercall::HostVisibilityType;
 use inspect::InspectMut;
 use memory_range::MemoryRange;
 use openhcl_tdisp_resources::VpciTdispInterface;
 use std::sync::Arc;
-use tdisp::GuestToHostCommand;
-use tdisp::TdispCommandId;
-use tdisp::TdispDeviceReport;
-use tdisp::TdispDeviceReportType;
-use tdisp::TdispGuestUnbindReason;
 use user_driver::DmaClient;
 use vmbus_client::local_use::Input;
 use vmcore::device_state::ChangeDeviceState;
@@ -115,14 +109,15 @@ pub async fn relay_vpci_bus(
     offer_info: vmbus_client::OfferInfo,
     dma_client: &dyn DmaClient,
     vmbus: &vmbus_server::VmbusServerControl,
+    tdisp_verifier: Option<&Arc<underhill_attestation::tdisp::TdispVerifier<'static>>>,
 ) -> anyhow::Result<()> {
     let instance_id = offer_info.offer.instance_id;
 
     let mmio = if true {
         let mshv_hvcall = MshvHvcall::new().context("failed to open mshv_hvcall device")?;
         mshv_hvcall.set_allowed_hypercalls(&[
-            hvdef::HypercallCode::HvCallMemoryMappedIoRead,
-            hvdef::HypercallCode::HvCallMemoryMappedIoWrite,
+            HypercallCode::HvCallMemoryMappedIoRead,
+            HypercallCode::HvCallMemoryMappedIoWrite,
         ]);
         Box::new(HypercallMmio(mshv_hvcall)) as _
     } else {
@@ -178,20 +173,15 @@ pub async fn relay_vpci_bus(
             let start_res = vpci_device.tdisp_start_device().await;
             tracing::info!(msg = format!("tdisp_start_device first time: {:?}", start_res));
 
+            // Attest device after it's been started and is ready
             if let Ok(_) = start_res {
-                tracing::info!(msg = "Issuing GHCB call to test TIO_GUEST_REQUEST ioctl");
-                let mut dev = sev_guest_device::ioctl::SevGuestDevice::open()
-                    .context("failed to open /dev/sev-guest")?;
-                tracing::info!(msg = "Opened /dev/sev-guest");
-
-                tracing::info!(msg = "Issuing GHCB call to test TIO_GUEST_REQUEST ioctl");
-
-                let guest_device_id = vpci_device.tdisp_get_tdi_device_id().await?;
-                tracing::info!(msg = format!("Guest device ID: {guest_device_id}"));
-
-                // [TDISP TODO] Test getting the attestation digests from the host, but do not validate them.
-                dev.tio_msg_tdi_info_req(guest_device_id as u16)
-                    .context("failed to issue TIO_GUEST_REQUEST ioctl")?;
+                if let Some(verifier) = tdisp_verifier {
+                    if let Err(e) = underhill_attestation::tdisp::attest_device(vpci_device.clone(), verifier.as_ref()).await {
+                        tracing::error!(error = %e, "TDISP device attestation encountered an error — MMIO/DMA will be blocked");
+                    }
+                } else {
+                    tracing::warn!("TDISP verifier not initialized - skipping device attestation");
+                }
 
                 let tdi_report = vpci_device.tdisp_get_tdi_report().await?;
                 tracing::info!(tdi_report = ?tdi_report);
@@ -262,8 +252,12 @@ impl PciConfigSpace for RelayedVpciDevice {
             // write to enable MMIO.
             let enable_mmio = value & 0x1 != 0;
             tracing::info!(msg = "CFG command register write", enable_mmio);
-            if enable_mmio && !self.0.has_attested() {
-                self.0.set_attested(true);
+            if enable_mmio && !self.0.mmio_setup_done() {
+                if !self.0.attestation_passed() {
+                    tracing::error!("MMIO/DMA enable blocked: device attestation did not pass");
+                    return IoResult::Ok;
+                }
+                self.0.set_mmio_setup_done();
                 // Get configured BARs
                 let bars = self.0.configured_bars();
                 tracing::info!(

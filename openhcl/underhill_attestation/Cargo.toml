@@ -14,6 +14,7 @@ openssl-vendored = ["openssl/vendored"]
 [target.'cfg(target_os = "linux")'.dependencies]
 guest_emulation_transport.workspace = true
 openhcl_attestation_protocol.workspace = true
+underhill_config.workspace = true
 vmgs = { workspace = true, features = ["encryption_ossl"] }
 guid.workspace = true
 mesh.workspace = true
@@ -22,11 +23,23 @@ tee_call.workspace = true
 pal_async.workspace = true
 tracing.workspace = true
 cvm_tracing.workspace = true
+vpci_client.workspace = true
+corim-rs = { git = "https://github.com/vtikoo/corim-rs", branch = "msft-extensions" }
+coset = { version = "0.3.8", features = ["std"] }
+ciborium = { version = "^0.2" }
+sev_guest_device.workspace = true
+openhcl_tdisp_resources.workspace = true
+tdisp.workspace = true
+anyhow.workspace = true
 
 base64.workspace = true
+hex.workspace = true
 base64-serde.workspace = true
 getrandom.workspace = true
 openssl.workspace = true
+der = { version = "0.7", features = ["std", "derive", "oid"] }
+asn1 = "0.21.0"
+x509-cert = { version = "0.2.5", features = ["builder"] }
 serde.workspace = true
 serde_json.workspace = true
 static_assertions.workspace = true
@@ -39,6 +52,7 @@ disklayer_ram.workspace = true
 disk_backend.workspace = true
 get_protocol.workspace = true
 vmgs_format.workspace = true
+futures-executor.workspace = true
 
 [lints]
 workspace = true

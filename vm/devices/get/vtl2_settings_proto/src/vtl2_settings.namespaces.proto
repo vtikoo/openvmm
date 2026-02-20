@@ -27,6 +27,7 @@ message Vtl2SettingsFixed {
     optional uint32 io_ring_size = 2;
     // Specify the maximum number of bounce buffer pages allowed per cpu
     optional uint32 max_bounce_buffer_pages = 3;
+    optional TdispDeviceRims tdisp_device_rims = 4;
 }
 
 message Vtl2SettingsDynamic {
@@ -174,4 +175,29 @@ message NicAcceleration {
     string instance_id = 1; // GUID
     // An unique instance ID of a paired/teamed networking device exposed directly to VTL0.
     string subordinate_instance_id = 2; // GUID
+}
+
+// Device RIM entry for TDISP attestation
+message TdispDeviceRim {
+    // PCI vendor ID
+    uint32 vendor_id = 1;
+    // PCI device ID
+    uint32 device_id = 2;
+    // Friendly device name
+    string device_name = 3;
+    // Base64-encoded CoseSign1 authenticity RIM from THIM
+    string auth_rim = 4;
+    // Base64-encoded CoseSign1 trust RIM from THIM
+    string trust_rim = 5;
+}
+
+// Settings used for the 'TdispDeviceRims' namespace
+message TdispDeviceRims {
+    // List of device RIMs
+    repeated TdispDeviceRim devices = 1;
+
+    // Reserve field numbers that would make this start with an ASCII whitespace
+    // character or JSON object opening brace '{', which would conflict with
+    // JSON detection.
+    reserved 9, 10, 12, 13, 32, 123;
 }
