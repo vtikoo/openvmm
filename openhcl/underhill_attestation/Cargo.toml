@@ -24,7 +24,7 @@ pal_async.workspace = true
 tracing.workspace = true
 cvm_tracing.workspace = true
 vpci_client.workspace = true
-corim-rs = { git = "https://github.com/vtikoo/corim-rs", branch = "msft-extensions" }
+corim = { version = "0.1.3", features = ["profile-intel"] }
 coset = { version = "0.3.8", features = ["std"] }
 ciborium = { version = "^0.2" }
 sev_guest_device.workspace = true

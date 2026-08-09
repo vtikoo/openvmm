@@ -2,7 +2,15 @@
 // Licensed under the MIT License.
 use anyhow::Context;
 use base64::Engine;
-use corim_rs::{Corim, HashAlgorithm};
+use corim::cbor;
+use corim::cbor::value::{Tagged, Value};
+use corim::types::comid::ComidTag;
+use corim::types::common::{CryptoKey, InstanceIdChoice, MeasuredElement};
+use corim::types::corim::{ConciseTagChoice, CorimMap};
+use corim::types::measurement::{Digest, DigestAlg, IntegrityRegisterId, IntegrityRegisters, MeasurementMap, MeasurementValuesMap, SvnChoice};
+use corim::types::signed::decode_signed_corim;
+use corim::types::tags::TAG_CORIM;
+use corim::types::triples::{ConditionalEndorsementSeriesTriple, ReferenceTriple};
 use hex;
 use openhcl_tdisp_resources::VpciTdispInterface;
 use openssl::sha::Sha384;
@@ -19,34 +27,101 @@ pub mod corim_generator;
 pub mod spdmcertchain;
 pub mod spdmmeasurements;
 
+const LEGACY_TCB_STATUS_KEY: i64 = 10001;
+const LEGACY_TCB_STATUS_DETAILS_KEY: i64 = 10003;
+const SHA256_ALG_ID: i64 = 1;
+const SHA384_ALG_ID: i64 = 7;
+const SHA512_ALG_ID: i64 = 8;
+
+/// Local wrapper that preserves the existing signed/unsigned control flow while
+/// using Azure/corim's `CorimMap` and COSE envelope types underneath.
+#[derive(Clone, Debug)]
+pub enum Corim {
+    Unsigned(CorimMap),
+    Signed(SignedCorim),
+}
+
+#[derive(Clone, Debug)]
+pub struct SignedCorim {
+    pub corim_map: CorimMap,
+}
+
+impl Corim {
+    fn corim_map(&self) -> &CorimMap {
+        match self {
+            Self::Unsigned(corim_map) => corim_map,
+            Self::Signed(signed) => &signed.corim_map,
+        }
+    }
+}
+
+fn decode_unsigned_corim_map(cbor_data: &[u8]) -> Result<CorimMap, anyhow::Error> {
+    let wrapped = corim::compat::wrap_bare_corim_map(cbor_data);
+    let tagged: Tagged<CorimMap> = cbor::decode(wrapped.as_bytes())
+        .context("Failed to decode unsigned CorimMap")?;
+
+    if tagged.tag != TAG_CORIM {
+        anyhow::bail!("Unexpected CORIM tag {}, expected {}", tagged.tag, TAG_CORIM);
+    }
+    Ok(tagged.value)
+}
+
+fn iter_comids(corim_map: &CorimMap) -> impl Iterator<Item = ComidTag> + '_ {
+    corim_map.tags.iter().filter_map(|tag| match tag {
+        ConciseTagChoice::Comid(_) | ConciseTagChoice::BareBstr(_) => tag.as_comid().ok(),
+        _ => None,
+    })
+}
+
+fn digest_alg_id(alg: &DigestAlg) -> Option<i64> {
+    match alg {
+        DigestAlg::Int(value) => Some(*value),
+        DigestAlg::Text(_) => None,
+        _ => None,
+    }
+}
+
+fn tcb_status_value(mval: &MeasurementValuesMap) -> Option<&str> {
+    mval.extra_entries
+        .get(&corim::profile::intel::MVAL_TEE_TCBSTATUS)
+        .or_else(|| mval.extra_entries.get(&LEGACY_TCB_STATUS_KEY))
+        .and_then(|value| match value {
+            Value::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+}
+
+fn has_tcb_status_details(mval: &MeasurementValuesMap) -> bool {
+    mval.extra_entries.contains_key(&LEGACY_TCB_STATUS_DETAILS_KEY)
+}
+
 /// Structure to hold both authenticity and trust CORIMs
 #[allow(missing_docs)]
-pub struct CorimPair<'a> {
-    pub authenticity: Corim<'a>,
-    pub trust: Corim<'a>,
+pub struct CorimPair {
+    pub authenticity: Corim,
+    pub trust: Corim,
 }
 
 /// TDISP verifier that manages CORIM mappings for device attestation
-pub struct TdispVerifier<'a> {
+pub struct TdispVerifier {
     /// Map from (vendor_id, device_id) pairs to CORIM pairs (Authenticity and Trust)
-    corims: HashMap<(u16, u16), CorimPair<'a>>,
+    corims: HashMap<(u16, u16), CorimPair>,
 }
 
-impl<'a> TdispVerifier<'a> {
+impl TdispVerifier {
     /// Create a new TdispVerifier with an empty CORIM map
     pub fn new() -> Self {
         Self {
             corims: HashMap::new(),
         }
     }
-
     /// Add both Authenticity and Trust CORIMs for a specific vendor/device ID pair
     pub fn add_corim_pair(
         &mut self,
         vendor_id: u16,
         device_id: u16,
-        authenticity: Corim<'a>,
-        trust: Corim<'a>,
+        authenticity: Corim,
+        trust: Corim,
     ) {
         let corim_pair = CorimPair {
             authenticity,
@@ -56,26 +131,26 @@ impl<'a> TdispVerifier<'a> {
     }
 
     /// Get the CORIM pair for a specific vendor/device ID pair
-    pub fn get_corim_pair(&self, vendor_id: u16, device_id: u16) -> Option<&CorimPair<'a>> {
+    pub fn get_corim_pair(&self, vendor_id: u16, device_id: u16) -> Option<&CorimPair> {
         self.corims.get(&(vendor_id, device_id))
     }
 
     /// Get the Authenticity CORIM for a specific vendor/device ID pair
-    pub fn get_authenticity_corim(&self, vendor_id: u16, device_id: u16) -> Option<&Corim<'a>> {
+    pub fn get_authenticity_corim(&self, vendor_id: u16, device_id: u16) -> Option<&Corim> {
         self.corims
             .get(&(vendor_id, device_id))
             .map(|pair| &pair.authenticity)
     }
 
     /// Get the Trust CORIM for a specific vendor/device ID pair
-    pub fn get_trust_corim(&self, vendor_id: u16, device_id: u16) -> Option<&Corim<'a>> {
+    pub fn get_trust_corim(&self, vendor_id: u16, device_id: u16) -> Option<&Corim> {
         self.corims
             .get(&(vendor_id, device_id))
             .map(|pair| &pair.trust)
     }
 
     /// Remove a CORIM pair for a specific vendor/device ID pair
-    pub fn remove_corim_pair(&mut self, vendor_id: u16, device_id: u16) -> Option<CorimPair<'a>> {
+    pub fn remove_corim_pair(&mut self, vendor_id: u16, device_id: u16) -> Option<CorimPair> {
         self.corims.remove(&(vendor_id, device_id))
     }
 
@@ -90,8 +165,8 @@ impl<'a> TdispVerifier<'a> {
         &mut self,
         vendor_id: u16,
         device_id: u16,
-        authenticity_corim: Corim<'a>,
-        trust_corim: Corim<'a>,
+        authenticity_corim: Corim,
+        trust_corim: Corim,
     ) -> Result<(), String> {
         // TODO: Validate signature and signer against authority in TDISP policy
         // Validate CORIM validity periods against current time
@@ -130,7 +205,7 @@ impl<'a> TdispVerifier<'a> {
 /// the TdispVerifier with the authenticity and trust CORIMs for each device.
 pub fn init_tdisp_verifier_from_settings(
     tdisp_device_rims: Option<&underhill_config::TdispDeviceRims>,
-) -> Result<TdispVerifier<'static>, anyhow::Error> {
+) -> Result<TdispVerifier, anyhow::Error> {
     let mut verifier = TdispVerifier::new();
 
     let Some(device_rims) = tdisp_device_rims else {
@@ -224,26 +299,26 @@ pub fn init_tdisp_verifier_from_settings(
 }
 
 /// Helper function to parse CORIM from CBOR data
-fn parse_corim_from_cbor(cbor_data: &[u8]) -> Result<Corim<'_>, anyhow::Error> {
+fn parse_corim_from_cbor(cbor_data: &[u8]) -> Result<Corim, anyhow::Error> {
     use coset::{CoseSign1, TaggedCborSerializable};
 
     // First try to parse as COSE-wrapped CoRIM (signed)
     match CoseSign1::from_tagged_slice(cbor_data) {
         Ok(cose_sign1) => {
-            // Convert CoseSign1 to SignedCorim using TryFrom
-            let signed_corim: corim_rs::SignedCorim = cose_sign1.try_into()
-                .context("Failed to convert CoseSign1 to SignedCorim")?;
+            let encoded = cose_sign1.to_tagged_vec().context("Failed to re-encode CoseSign1")?;
+            let signed_corim = decode_signed_corim(&encoded)
+                .context("Failed to decode signed CoRIM envelope")?;
+            let payload = signed_corim
+                .payload
+                .as_deref()
+                .context("Signed CoRIM uses a detached payload, which is unsupported here")?;
+            let corim_map = decode_unsigned_corim_map(payload)?;
 
-            // Create TaggedSignedCorim from SignedCorim
-            let tagged_signed = corim_rs::TaggedSignedCorim::new(signed_corim);
-            Ok(corim_rs::ConciseRimTypeChoice::Signed(tagged_signed))
+            Ok(Corim::Signed(SignedCorim { corim_map }))
         }
         Err(_) => {
-            // If not COSE-wrapped, try parsing as unsigned CorimMap
-            let corim_map: corim_rs::CorimMap<'_> = ciborium::de::from_reader(cbor_data)
-                .context("Failed to parse unsigned CorimMap")?;
-
-            Ok(corim_rs::ConciseRimTypeChoice::Unsigned(corim_rs::TaggedUnsignedCorim::from(corim_map)))
+            let corim_map = decode_unsigned_corim_map(cbor_data)?;
+            Ok(Corim::Unsigned(corim_map))
         }
     }
 }
@@ -253,7 +328,7 @@ fn parse_corim_from_cbor(cbor_data: &[u8]) -> Result<Corim<'_>, anyhow::Error> {
 /// Returns Ok(()) if attestation succeeds, Err if it fails
 pub async fn attest_device(
     vpci_device: std::sync::Arc<VpciDevice>,
-    verifier: &TdispVerifier<'_>,
+    verifier: &TdispVerifier,
 ) -> Result<(), anyhow::Error> {
     // Get the device vendor/device IDs from the VPCI device
     let vendor_id = vpci_device.vendor_id();
@@ -305,7 +380,7 @@ pub async fn attest_device(
 /// Returns a tuple of (identity_verified, measurements_verified)
 pub async fn local_attestation(
     vpci_device: &VpciDevice,
-    verifier: &TdispVerifier<'_>,
+    verifier: &TdispVerifier,
 ) -> (bool, bool) {
     let vendor_id = vpci_device.vendor_id();
     let device_id = vpci_device.device_id();
@@ -556,7 +631,7 @@ fn sha_384(data: &[u8]) -> [u8; 48] {
 /// 2. Compare root certificate thumbprint against CORIM device identity triple
 async fn validate_certificate_chain(
     cert_chain: &spdmcertchain::CertificateChain,
-    authenticity_corim: &Corim<'_>,
+    authenticity_corim: &Corim,
 ) -> Result<bool, anyhow::Error> {
     use openssl::hash::{MessageDigest, hash};
 
@@ -576,65 +651,46 @@ async fn validate_certificate_chain(
         .to_der()
         .context("Failed to serialize root certificate to DER")?;
 
-    // Extract CorimMap from the Corim enum
-    let corim_map: &corim_rs::CorimMap<'_> = match authenticity_corim {
-        corim_rs::ConciseRimTypeChoice::Unsigned(tagged) => tagged,
-        corim_rs::ConciseRimTypeChoice::Signed(signed) => &signed.corim_map,
-    };
+    let corim_map = authenticity_corim.corim_map();
 
     // Loop over COMID tags for dev-identity-keys triple (IdentityTripleRecord)
     // TODO: Look for triple with environment.instance as base64(SPDM_certificate)
-    for tag in &corim_map.tags {
-        // Check if this tag is a CoMID (Concise Module Identity)
-        if let corim_rs::ConciseTagTypeChoice::Mid(comid_tag) = tag {
-            let comid = &**comid_tag;
-
-            // Get identity triples from the CoMID triples
-            if let Some(ref identity_triples) = comid.triples.identity_triples {
-                for triple in identity_triples {
-                    // Iterate through the key_list in the IdentityTripleRecord
-                    for crypto_key in &triple.key_list {
-                        // Check if this is a CertThumbprint variant
-                        if let Some(cert_thumbprint) = crypto_key.as_ref_cert_thumbprint() {
-                            // CertThumbprintType wraps a Digest, access it
-                            let digest = cert_thumbprint.as_ref();
-
-                            // Use the digest algorithm from the identity triple to compute thumbprint
-                            let message_digest = match digest.alg {
-                                HashAlgorithm::Sha256 => MessageDigest::sha256(),
-                                HashAlgorithm::Sha384 => MessageDigest::sha384(),
-                                HashAlgorithm::Sha512 => MessageDigest::sha512(),
-                                _ => {
-                                    tracing::debug!(
-                                        "Unsupported hash algorithm in identity triple: {:?}",
-                                        digest.alg
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            // Compute thumbprint using the algorithm from the identity triple
-                            let root_thumbprint = hash(message_digest, &root_cert_der)
-                                .context("Failed to compute root certificate hash")?;
-
-                            // Get the expected digest value bytes from CORIM
-                            let expected_thumbprint = digest.val.as_ref();
-
-                            // Compare thumbprints
-                            if root_thumbprint.as_ref() == expected_thumbprint {
+    for comid in iter_comids(corim_map) {
+        if let Some(ref identity_triples) = comid.triples.identity_triples {
+            for triple in identity_triples {
+                for crypto_key in &triple.1 {
+                    if let CryptoKey::CertThumbprint(digest) = crypto_key {
+                        let message_digest = match digest_alg_id(digest.alg()) {
+                            Some(SHA256_ALG_ID) => MessageDigest::sha256(),
+                            Some(SHA384_ALG_ID) => MessageDigest::sha384(),
+                            Some(SHA512_ALG_ID) => MessageDigest::sha512(),
+                            other => {
                                 tracing::debug!(
-                                    "Root certificate thumbprint matches CORIM device identity using {:?}",
-                                    digest.alg
+                                    "Unsupported hash algorithm in identity triple: {:?}",
+                                    other
                                 );
-                                return Ok(true);
-                            } else {
-                                tracing::debug!(
-                                    "Thumbprint mismatch ({}): computed={}, expected={}",
-                                    format!("{:?}", digest.alg).to_uppercase(),
-                                    hex::encode(root_thumbprint.as_ref()),
-                                    hex::encode(expected_thumbprint)
-                                );
+                                continue;
                             }
+                        };
+
+                        let root_thumbprint = hash(message_digest, &root_cert_der)
+                            .context("Failed to compute root certificate hash")?;
+
+                        let expected_thumbprint = digest.value();
+
+                        if root_thumbprint.as_ref() == expected_thumbprint {
+                            tracing::debug!(
+                                "Root certificate thumbprint matches CORIM device identity using {:?}",
+                                digest.alg()
+                            );
+                            return Ok(true);
+                        } else {
+                            tracing::debug!(
+                                "Thumbprint mismatch ({}): computed={}, expected={}",
+                                digest.alg(),
+                                hex::encode(root_thumbprint.as_ref()),
+                                hex::encode(expected_thumbprint)
+                            );
                         }
                     }
                 }
@@ -652,7 +708,7 @@ async fn validate_certificate_chain(
 /// 4d. Verify TCBInfo values against Trust CORIM conditional endorsement series
 async fn validate_tcb_info(
     cert_chain: &spdmcertchain::CertificateChain,
-    corim_pair: &CorimPair<'_>,
+    corim_pair: &CorimPair,
 ) -> Result<(bool, bool), anyhow::Error> {
     // Parse X.509 certificates to extract TCBInfo extensions
     let x509_certs = cert_chain
@@ -697,64 +753,56 @@ async fn validate_tcb_info(
 /// Now processes CORIM reference triples first and matches against certificate layers
 fn validate_tcb_against_authenticity_corim(
     x509_certs: &[X509],
-    authenticity_corim: &Corim<'_>,
+    authenticity_corim: &Corim,
 ) -> Result<bool, anyhow::Error> {
     use crate::tdisp::spdmcertchain::extract_dice_tcb_info;
 
-    // Extract CorimMap from the Corim enum
-    let corim_map: &corim_rs::CorimMap<'_> = match authenticity_corim {
-        corim_rs::ConciseRimTypeChoice::Unsigned(tagged) => tagged,
-        corim_rs::ConciseRimTypeChoice::Signed(signed) => &signed.corim_map,
-    };
+    let corim_map = authenticity_corim.corim_map();
 
     let mut validated_layers = 0;
     let mut total_tcb_triples = 0;
 
     // Process all reference triples looking for TCBInfo entries
-    for tag in &corim_map.tags {
-        if let corim_rs::ConciseTagTypeChoice::Mid(comid_tag) = tag {
-            let comid = &**comid_tag;
+    for comid in iter_comids(corim_map) {
+        if let Some(ref reference_triples) = comid.triples.reference_triples {
+            for triple in reference_triples {
+                // Check if this is a TCBInfo reference triple and get the target layer/certificate
+                if let Some((layer_val, cert_index)) =
+                    get_tcb_info_layer_and_cert_index(triple.environment(), x509_certs.len())?
+                {
+                    total_tcb_triples += 1;
 
-            if let Some(ref reference_triples) = comid.triples.reference_triples {
-                for triple in reference_triples {
-                    // Check if this is a TCBInfo reference triple and get the target layer/certificate
-                    if let Some((layer_val, cert_index)) =
-                        get_tcb_info_layer_and_cert_index(&triple.ref_env, x509_certs.len())?
-                    {
-                        total_tcb_triples += 1;
+                    tracing::debug!("Found TCBInfo reference triple for layer {}", layer_val);
 
-                        tracing::debug!("Found TCBInfo reference triple for layer {}", layer_val);
-
-                        // Extract DICE TCBInfo from the corresponding certificate
-                        let cert = &x509_certs[cert_index];
-                        match extract_dice_tcb_info(cert)? {
-                            Some(dice_tcb_info) => {
-                                if validate_dice_tcb_against_reference_claims(
-                                    &dice_tcb_info,
-                                    triple,
-                                    Some(layer_val),
-                                )? {
-                                    validated_layers += 1;
-                                    tracing::info!(
-                                        "TCBInfo validation passed for layer {}",
-                                        layer_val
-                                    );
-                                } else {
-                                    tracing::error!(
-                                        "TCBInfo validation failed for layer {}",
-                                        layer_val
-                                    );
-                                    return Ok(false);
-                                }
-                            }
-                            None => {
+                    // Extract DICE TCBInfo from the corresponding certificate
+                    let cert = &x509_certs[cert_index];
+                    match extract_dice_tcb_info(cert)? {
+                        Some(dice_tcb_info) => {
+                            if validate_dice_tcb_against_reference_claims(
+                                &dice_tcb_info,
+                                triple,
+                                Some(layer_val),
+                            )? {
+                                validated_layers += 1;
+                                tracing::info!(
+                                    "TCBInfo validation passed for layer {}",
+                                    layer_val
+                                );
+                            } else {
                                 tracing::error!(
-                                    "No DICE TCBInfo found in certificate at index {} for layer {}",
-                                    cert_index,
+                                    "TCBInfo validation failed for layer {}",
                                     layer_val
                                 );
                                 return Ok(false);
                             }
+                        }
+                        None => {
+                            tracing::error!(
+                                "No DICE TCBInfo found in certificate at index {} for layer {}",
+                                cert_index,
+                                layer_val
+                            );
+                            return Ok(false);
                         }
                     }
                 }
@@ -790,15 +838,14 @@ const TCB_INFO_BYTES: [u8; 12] = [86, 69, 78, 67, 83, 87, 53, 109, 98, 119, 61, 
 /// - Ok(None) if this is not a TCBInfo environment (caller should skip this triple)  
 /// - Err(...) if this is a TCBInfo environment but validation failed (attestation should fail)
 fn get_tcb_info_layer_and_cert_index(
-    env: &corim_rs::EnvironmentMap<'_>,
+    env: &corim::types::environment::EnvironmentMap,
     x509_certs_len: usize,
 ) -> Result<Option<(u64, usize)>, anyhow::Error> {
     // Check if environment instance is "TCBInfo"
     let is_tcb_info = if let Some(ref instance) = env.instance {
         match instance {
-            corim_rs::InstanceIdTypeChoice::Bytes(tagged_bytes) => {
-                // Extract bytes from TaggedBytes and check if it's "TCBInfo"
-                let bytes: &[u8] = tagged_bytes.as_ref().as_ref();
+            InstanceIdChoice::Bytes(bytes) => {
+                let bytes: &[u8] = bytes.as_slice();
                 bytes == &TCB_INFO_BYTES
             }
             _ => false,
@@ -817,7 +864,7 @@ fn get_tcb_info_layer_and_cert_index(
     // Check if layer is present and is 0 or 1
     let layer_val = if let Some(ref class) = env.class {
         if let Some(layer) = class.layer {
-            let layer_val = layer.0 as u64;
+            let layer_val = layer;
             if layer_val == 0 || layer_val == 1 {
                 layer_val
             } else {
@@ -876,7 +923,7 @@ fn get_tcb_info_layer_and_cert_index(
 ///
 /// Logs a warning if any unsupported criteria are found, but always returns true (warning-only policy).
 fn validate_measurement_values_map_support(
-    mval: &corim_rs::MeasurementValuesMap<'_>,
+    mval: &MeasurementValuesMap,
     context: &str,
 ) {
     let mut unsupported_fields = Vec::new();
@@ -885,8 +932,8 @@ fn validate_measurement_values_map_support(
     if mval.flags.is_some() {
         unsupported_fields.push("flags");
     }
-    if mval.raw.is_some() {
-        unsupported_fields.push("raw");
+    if mval.raw_value.is_some() {
+        unsupported_fields.push("raw_value");
     }
     if mval.mac_addr.is_some() {
         unsupported_fields.push("mac_addr");
@@ -909,16 +956,16 @@ fn validate_measurement_values_map_support(
     if mval.cryptokeys.is_some() {
         unsupported_fields.push("cryptokeys");
     }
-    if mval.tcb_status.is_some() {
+    if tcb_status_value(mval).is_some() {
         unsupported_fields.push("tcb_status");
     }
-    if mval.tcb_date.is_some() {
-        unsupported_fields.push("tcb_date");
-    }
-    if mval.tcb_status_details.is_some() {
+    if has_tcb_status_details(mval) {
         unsupported_fields.push("tcb_status_details");
     }
-    if mval.extensions.is_some() {
+    if !mval.extra_entries.is_empty()
+        && tcb_status_value(mval).is_none()
+        && !has_tcb_status_details(mval)
+    {
         unsupported_fields.push("extensions");
     }
 
@@ -946,7 +993,7 @@ fn validate_measurement_values_map_support(
 /// Note: Unsupported validation criteria are logged as warnings but do not cause failure
 /// (warning-only policy, same as SPDM measurements).
 fn validate_measurement_map_against_dice_tcb(
-    measurement_map: &corim_rs::MeasurementMap<'_>,
+    measurement_map: &MeasurementMap,
     dice_tcb_info: &spdmcertchain::DiceTcbInfo,
     context: &str,
 ) -> Result<bool, anyhow::Error> {
@@ -1023,17 +1070,18 @@ fn validate_measurement_map_against_dice_tcb(
 ///
 /// Returns (extracted_svn_value, validation_result)
 fn validate_svn_claim(
-    svn_claim: &corim_rs::SvnTypeChoice,
+    svn_claim: &SvnChoice,
     current_svn: Option<u64>,
     context: &str,
 ) -> (u64, bool) {
     // Extract SVN value and determine comparison type from the claim variant
     let (reference_svn, is_minimum_check) = match svn_claim {
-        corim_rs::SvnTypeChoice::Svn(svn) => (svn.0 as u64, false), // exact comparison
-        corim_rs::SvnTypeChoice::TaggedSvn(tagged_svn) => (tagged_svn.as_ref().0 as u64, false), // exact comparison
-        corim_rs::SvnTypeChoice::TaggedMinSvn(tagged_min_svn) => {
-            (tagged_min_svn.as_ref().0 as u64, true)
-        } // minimum comparison
+        SvnChoice::ExactValue(svn) => (*svn, false),
+        SvnChoice::MinValue(svn) => (*svn, true),
+        _ => {
+            tracing::warn!("Unsupported SVN choice variant in {}", context);
+            return (0, false);
+        }
     };
 
     // Check if current SVN exists
@@ -1067,7 +1115,7 @@ fn validate_svn_claim(
 /// This function checks that ALL reference digests find matching FWIDs in the provided collection.
 /// Returns true only if every reference digest has a corresponding FWID match.
 fn validate_reference_digests_against_fwids(
-    reference_digests: &[corim_rs::Digest],
+    reference_digests: &[Digest],
     fwids: &[spdmcertchain::Fwid],
     context: &str,
 ) -> Result<bool, anyhow::Error> {
@@ -1078,7 +1126,7 @@ fn validate_reference_digests_against_fwids(
 
     // For each reference digest, check if ANY FWID matches - ALL reference digests must be found
     for (digest_idx, reference_digest) in reference_digests.iter().enumerate() {
-        let reference_bytes: &[u8] = reference_digest.val.as_ref();
+        let reference_bytes = reference_digest.value();
 
         let mut found_matching_fwid = false;
         for (_fwid_idx, dice_fwid) in fwids.iter().enumerate() {
@@ -1104,38 +1152,37 @@ fn validate_reference_digests_against_fwids(
 /// 2. If match found, do FWID-style verification (any digest in register can match any reference digest)
 /// 3. All reference integrity registers must find a match
 fn validate_integrity_registers(
-    reference_registers: &corim_rs::IntegrityRegisters<'_>,
+    reference_registers: &IntegrityRegisters,
     dice_registers: &[spdmcertchain::IntegrityRegister],
     context: &str,
 ) -> Result<bool, anyhow::Error> {
     if dice_registers.is_empty() {
-        tracing::error!("{}: no integrity registers available but {} reference register(s) provided", context, reference_registers.len());
+        tracing::error!("{}: no integrity registers available but {} reference register(s) provided", context, reference_registers.0.len());
         return Ok(false);
     }
 
     // For each reference integrity register, find matching DICE integrity register and validate
-    for (ref_reg_idx, (ref_label, ref_digests)) in reference_registers.iter().enumerate() {
+    for (ref_reg_idx, (ref_label, ref_digests)) in reference_registers.0.iter().enumerate() {
         let mut found_matching_register = false;
 
         for (_dice_reg_idx, dice_integrity_reg) in dice_registers.iter().enumerate() {
             // Match by register label (name or number)
             let label_matches = match ref_label {
-                corim_rs::Ulabel::Text(ref_text) => {
+                IntegrityRegisterId::Text(ref_text) => {
                     if let Some(dice_name) = &dice_integrity_reg.register_name {
-                        let ref_name_str: &str = ref_text.as_ref();
-                        ref_name_str == dice_name
+                        ref_text == dice_name
                     } else {
                         false
                     }
                 }
-                corim_rs::Ulabel::Uint(ref_uint) => {
+                IntegrityRegisterId::Uint(ref_uint) => {
                     if let Some(dice_num) = dice_integrity_reg.register_num {
-                        let ref_num_val = ref_uint.0 as u64;
-                        ref_num_val == dice_num
+                        *ref_uint == dice_num
                     } else {
                         false
                     }
                 }
+                _ => false,
             };
 
             if label_matches {
@@ -1179,17 +1226,17 @@ fn validate_integrity_registers(
 /// Currently we check for version, svn, digests (FWIDs), and integrity registers
 fn validate_dice_tcb_against_reference_claims(
     dice_tcb_info: &spdmcertchain::DiceTcbInfo,
-    reference_triple: &corim_rs::ReferenceTripleRecord<'_>,
+    reference_triple: &ReferenceTriple,
     layer: Option<u64>,
 ) -> Result<bool, anyhow::Error> {
     tracing::debug!(
         "Validating {} reference claim(s) for layer {:?}",
-        reference_triple.ref_claims.len(),
+        reference_triple.measurements().len(),
         layer
     );
 
     // Try to match each reference claim - only ONE needs to match entirely
-    for (claim_idx, claim) in reference_triple.ref_claims.iter().enumerate() {
+    for (claim_idx, claim) in reference_triple.measurements().iter().enumerate() {
         let context = format!("Reference claim #{} (layer {:?})", claim_idx, layer);
 
         // Use the common validation function
@@ -1217,71 +1264,60 @@ fn validate_dice_tcb_against_reference_claims(
 /// 3. Performs required verification at each step
 fn validate_tcb_against_trust_corim(
     x509_certs: &[X509],
-    trust_corim: &Corim<'_>,
+    trust_corim: &Corim,
 ) -> Result<bool, anyhow::Error> {
     use spdmcertchain::extract_dice_tcb_info;
 
-    // Extract CorimMap from the Trust CORIM
-    let corim_map: &corim_rs::CorimMap<'_> = match trust_corim {
-        corim_rs::ConciseRimTypeChoice::Unsigned(tagged) => tagged,
-        corim_rs::ConciseRimTypeChoice::Signed(signed) => &signed.corim_map,
-    };
+    let corim_map = trust_corim.corim_map();
 
     let mut all_layers_current = true;
     let mut evaluated_layers = 0;
 
     // Look for conditional endorsement series in CoMID tags (layer-based TCB evolution tracking)
-    for tag in &corim_map.tags {
-        if let corim_rs::ConciseTagTypeChoice::Mid(comid_tag) = tag {
-            let comid = &**comid_tag;
+    for comid in iter_comids(corim_map) {
+        if let Some(ref conditional_series) = comid.triples.conditional_endorsement_series {
+            for (series_idx, series) in conditional_series.iter().enumerate() {
+                // Step 1: Track initial environment state from condition and get target certificate
+                let (layer_num, cert_index) = if let Some((layer_num, cert_index)) =
+                    get_tcb_info_layer_and_cert_index(
+                        &series.condition().environment,
+                        x509_certs.len(),
+                    )? {
+                    evaluated_layers += 1;
+                    (layer_num, cert_index)
+                } else {
+                    tracing::warn!(
+                        "Series #{} does not have valid TCBInfo environment",
+                        series_idx
+                    );
+                    continue;
+                };
 
-            // Check conditional endorsement series for measurement evolution tracking
-            if let Some(ref conditional_series) =
-                comid.triples.conditional_endorsement_series_triples
-            {
-                for (series_idx, series) in conditional_series.iter().enumerate() {
-                    // Step 1: Track initial environment state from condition and get target certificate
-                    let (layer_num, cert_index) = if let Some((layer_num, cert_index)) =
-                        get_tcb_info_layer_and_cert_index(
-                            &series.condition.environment,
-                            x509_certs.len(),
-                        )? {
-                        evaluated_layers += 1;
-                        (layer_num, cert_index)
-                    } else {
-                        tracing::warn!(
-                            "Series #{} does not have valid TCBInfo environment",
-                            series_idx
-                        );
-                        continue;
-                    };
+                // Extract current DICE TCBInfo from the certificate (current state)
+                let cert = &x509_certs[cert_index];
+                match extract_dice_tcb_info(cert)? {
+                    Some(dice_tcb_info) => {
+                        // Evaluate series of allowed changes and verify at each step
+                        let tcb_up_to_date = evaluate_conditional_endorsement_series(
+                            &dice_tcb_info,
+                            series,
+                            layer_num,
+                        )?;
 
-                    // Extract current DICE TCBInfo from the certificate (current state)
-                    let cert = &x509_certs[cert_index];
-                    match extract_dice_tcb_info(cert)? {
-                        Some(dice_tcb_info) => {
-                            // Evaluate series of allowed changes and verify at each step
-                            let tcb_up_to_date = evaluate_conditional_endorsement_series(
-                                &dice_tcb_info,
-                                series,
-                                layer_num,
-                            )?;
-
-                            if !tcb_up_to_date {
-                                tracing::warn!(
-                                    "Layer {} TCB is out of date according to conditional endorsement series",
-                                    layer_num
-                                );
-                                all_layers_current = false;
-                            }
-                        }
-                        None => {
-                            tracing::error!(
-                                "No DICE TCBInfo found in cert {} for layer {} Trust evaluation",
-                                cert_index, layer_num
+                        if !tcb_up_to_date {
+                            tracing::warn!(
+                                "Layer {} TCB is out of date according to conditional endorsement series",
+                                layer_num
                             );
                             all_layers_current = false;
                         }
+                    }
+                    None => {
+                        tracing::error!(
+                            "No DICE TCBInfo found in cert {} for layer {} Trust evaluation",
+                            cert_index, layer_num
+                        );
+                        all_layers_current = false;
                     }
                 }
             }
@@ -1314,7 +1350,7 @@ fn validate_tcb_against_trust_corim(
 /// matching condition in the conditional endorsement series
 fn evaluate_conditional_endorsement_series(
     dice_tcb_info: &spdmcertchain::DiceTcbInfo,
-    series: &corim_rs::ConditionalEndorsementSeriesTripleRecord<'_>,
+    series: &ConditionalEndorsementSeriesTriple,
     layer: u64,
 ) -> Result<bool, anyhow::Error> {
     let current_version = dice_tcb_info.version.as_deref().unwrap_or("unknown");
@@ -1322,12 +1358,12 @@ fn evaluate_conditional_endorsement_series(
 
     tracing::debug!(
         "Evaluating conditional endorsement series for layer {}: version='{}', SVN={}, {} evolution record(s)",
-        layer, current_version, current_svn, series.series.len()
+        layer, current_version, current_svn, series.series().len()
     );
 
     // Validate against condition environment (initial state check)
-    if !series.condition.claims_list.is_empty() {
-        for (claim_idx, claim) in series.condition.claims_list.iter().enumerate() {
+    if !series.condition().claims_list.is_empty() {
+        for (claim_idx, claim) in series.condition().claims_list.iter().enumerate() {
             let context = format!("Condition #{}", claim_idx);
             if !validate_measurement_map_against_dice_tcb(claim, dice_tcb_info, &context)? {
                 return Ok(false);
@@ -1338,10 +1374,10 @@ fn evaluate_conditional_endorsement_series(
     // Evaluate series of allowed measurement changes
     // The first series selection criteria that matches terminates series matching
     // and the endorsement values are added to the Attester's actual state
-    for (_record_idx, record) in series.series.iter().enumerate() {
+    for (_record_idx, record) in series.series().iter().enumerate() {
         let mut meets_all_selections = true;
 
-        for (sel_idx, selection) in record.selection.iter().enumerate() {
+        for (sel_idx, selection) in record.selection().iter().enumerate() {
             let context = format!("Selection #{}", sel_idx);
             if !validate_measurement_map_against_dice_tcb(selection, dice_tcb_info, &context)? {
                 meets_all_selections = false;
@@ -1352,16 +1388,15 @@ fn evaluate_conditional_endorsement_series(
         // If selection criteria are met, this is our first match - apply endorsements and terminate
         if meets_all_selections {
             // Expect exactly one measurement map in addition with TCB status
-            if record.addition.len() != 1 {
+            if record.addition().len() != 1 {
                 anyhow::bail!(
                     "Expected exactly 1 measurement map in addition, got {}",
-                    record.addition.len()
+                    record.addition().len()
                 );
             }
 
-            let addition = &record.addition[0];
-            if let Some(ref tcb_status) = addition.mval.tcb_status {
-                let status_str = tcb_status.as_ref();
+            let addition = &record.addition()[0];
+            if let Some(status_str) = tcb_status_value(&addition.mval) {
 
                 // Parse the TCB status string and return the appropriate boolean value
                 let tcb_up_to_date = match status_str {
@@ -1382,9 +1417,9 @@ fn evaluate_conditional_endorsement_series(
                 };
 
                 return Ok(tcb_up_to_date);
-            } else {
-                anyhow::bail!("Addition measurement map missing required tcb_status field");
             }
+
+            anyhow::bail!("Addition measurement map missing required tcb_status field");
         }
     }
 
@@ -1403,7 +1438,7 @@ fn evaluate_conditional_endorsement_series(
 /// Verify measurements against Trust CORIM conditional endorsement series
 async fn validate_measurements(
     measurements_data: &[u8],
-    corim_pair: &CorimPair<'_>,
+    corim_pair: &CorimPair,
 ) -> Result<(bool, bool), anyhow::Error> {
     // Parse the SPDM measurements response
     let measurements = parse_spdm_measurements_response(measurements_data)?;
@@ -1492,24 +1527,25 @@ fn parse_spdm_measurements_response(
     Ok(spdm_response.measurement_records)
 }
 
-fn is_spdm_measurements_record(env: &corim_rs::EnvironmentMap<'_>) -> Result<bool, anyhow::Error> {
+fn is_spdm_measurements_record(
+    env: &corim::types::environment::EnvironmentMap,
+) -> Result<bool, anyhow::Error> {
     if let Some(ref instance) = env.instance {
-        // Check if environment instance contains "SPDMMeasurement" in base64
+        // Check if environment instance contains the SPDM measurements label,
+        // either as raw bytes or base64-encoded bytes.
         let is_spdm_measurement = match instance {
-            corim_rs::InstanceIdTypeChoice::Bytes(tagged_bytes) => {
-                let bytes: &[u8] = tagged_bytes.as_ref().as_ref();
+            InstanceIdChoice::Bytes(bytes) => {
+                let bytes: &[u8] = bytes.as_slice();
+                let matches_measurement_label = |candidate: &[u8]| {
+                    let candidate_str = std::str::from_utf8(candidate).unwrap_or_default();
+                    candidate_str.contains("SPDMMeasurement")
+                        || candidate_str.contains("SPDM Measurements")
+                };
 
-                // Try to decode as base64 and check if it contains "SPDMMeasurement"
+                // Try to decode as base64 first; if that fails, inspect the raw bytes.
                 match base64::engine::general_purpose::STANDARD.decode(bytes) {
-                    Ok(decoded) => {
-                        let decoded_str = String::from_utf8_lossy(&decoded);
-                        decoded_str.contains("SPDMMeasurement")
-                    }
-                    Err(_) => {
-                        // If not valid base64, check raw bytes
-                        let raw_str = String::from_utf8_lossy(bytes);
-                        raw_str.contains("SPDMMeasurement")
-                    }
+                    Ok(decoded) => matches_measurement_label(&decoded),
+                    Err(_) => matches_measurement_label(bytes),
                 }
             }
             _ => false,
@@ -1526,39 +1562,28 @@ fn is_spdm_measurements_record(env: &corim_rs::EnvironmentMap<'_>) -> Result<boo
 ///
 fn validate_measurements_against_authenticity_corim(
     measurements: &[spdmmeasurements::MeasurementRecord],
-    authenticity_corim: &Corim<'_>,
+    authenticity_corim: &Corim,
 ) -> Result<bool, anyhow::Error> {
-    // Extract CorimMap from the Corim enum
-    let corim_map: &corim_rs::CorimMap<'_> = match authenticity_corim {
-        corim_rs::ConciseRimTypeChoice::Unsigned(tagged) => tagged,
-        corim_rs::ConciseRimTypeChoice::Signed(signed) => &signed.corim_map,
-    };
+    let corim_map = authenticity_corim.corim_map();
 
     let mut total_measurement_triples = 0;
 
     tracing::debug!("Validating measurements against Authenticity CORIM reference triples");
 
     // Process all reference triples looking for SPDM measurements entries
-    for tag in &corim_map.tags {
-        if let corim_rs::ConciseTagTypeChoice::Mid(comid_tag) = tag {
-            let comid = &**comid_tag;
-
-            if let Some(ref reference_triples) = comid.triples.reference_triples {
-                for triple in reference_triples {
-                    // Check if this is an SPDM measurements reference triple by examining environment instance
-                    let is_spdm_measurement = is_spdm_measurements_record(&triple.ref_env)?;
-                    if is_spdm_measurement {
-                        total_measurement_triples += 1;
-                        tracing::debug!("Validating SPDM measurements against reference claims");
-                        if validate_spdm_measurements_against_reference_claims(
-                            measurements,
-                            triple,
-                        )? {
-                            tracing::info!("SPDM measurements validation passed - reference triple matched entirely");
-                            return Ok(true);
-                        } else {
-                            tracing::error!("Reference triple did not match SPDM measurements");
-                        }
+    for comid in iter_comids(corim_map) {
+        if let Some(ref reference_triples) = comid.triples.reference_triples {
+            for triple in reference_triples {
+                // Check if this is an SPDM measurements reference triple by examining environment instance
+                let is_spdm_measurement = is_spdm_measurements_record(triple.environment())?;
+                if is_spdm_measurement {
+                    total_measurement_triples += 1;
+                    tracing::debug!("Validating SPDM measurements against reference claims");
+                    if validate_spdm_measurements_against_reference_claims(measurements, triple)? {
+                        tracing::info!("SPDM measurements validation passed - reference triple matched entirely");
+                        return Ok(true);
+                    } else {
+                        tracing::error!("Reference triple did not match SPDM measurements");
                     }
                 }
             }
@@ -1581,17 +1606,17 @@ fn validate_measurements_against_authenticity_corim(
 /// Uses mkey of type UInt as specified in the documentation
 fn validate_spdm_measurements_against_reference_claims(
     measurements: &[spdmmeasurements::MeasurementRecord],
-    reference_triple: &corim_rs::ReferenceTripleRecord<'_>,
+    reference_triple: &ReferenceTriple,
 ) -> Result<bool, anyhow::Error> {
     let mut validated_claims = 0;
 
     // Try to match each reference claim - all addressable claims must match
-    for (claim_idx, claim) in reference_triple.ref_claims.iter().enumerate() {
+    for (claim_idx, claim) in reference_triple.measurements().iter().enumerate() {
         // Check if this claim has an mkey (measurement key identifier)
         if let Some(ref mkey) = claim.mkey {
             // Extract UInt value from mkey as per documentation
-            if let corim_rs::MeasuredElementTypeChoice::UInt(uint_key) = mkey {
-                let key_value = uint_key.0 as u8;
+            if let MeasuredElement::Uint(uint_key) = mkey {
+                let key_value = *uint_key as u8;
 
                 // Find matching measurement by index
                 if let Some(measurement_record) =
@@ -1630,12 +1655,12 @@ fn validate_spdm_measurements_against_reference_claims(
 
     // Warn if the reference triple has fewer claims than the number of SPDM measurement blocks,
     // meaning some device measurements are not covered by reference values.
-    if reference_triple.ref_claims.len() < measurements.len() {
+    if reference_triple.measurements().len() < measurements.len() {
         tracing::warn!(
             "Reference triple has {} claim(s) but SPDM response has {} measurement block(s) - {} measurement(s) are not covered by reference values",
-            reference_triple.ref_claims.len(),
+            reference_triple.measurements().len(),
             measurements.len(),
-            measurements.len() - reference_triple.ref_claims.len()
+            measurements.len() - reference_triple.measurements().len()
         );
     }
 
@@ -1646,7 +1671,7 @@ fn validate_spdm_measurements_against_reference_claims(
 /// Validate a single measurement against a measurement claim
 fn validate_single_measurement_against_claim(
     measurement: &spdmmeasurements::DmtfMeasurement,
-    claim: &corim_rs::MeasurementMap<'_>,
+    claim: &MeasurementMap,
 ) -> Result<bool, anyhow::Error> {
     // Warn about unsupported fields in SPDM measurement claims (non-fatal)
     // Unlike DICE TCBInfo which fails closed, SPDM measurements log warnings
@@ -1682,16 +1707,16 @@ fn validate_single_measurement_against_claim(
     if claim.mval.cryptokeys.is_some() {
         unsupported_fields.push("cryptokeys");
     }
-    if claim.mval.tcb_status.is_some() {
+    if tcb_status_value(&claim.mval).is_some() {
         unsupported_fields.push("tcb_status");
     }
-    if claim.mval.tcb_date.is_some() {
-        unsupported_fields.push("tcb_date");
-    }
-    if claim.mval.tcb_status_details.is_some() {
+    if has_tcb_status_details(&claim.mval) {
         unsupported_fields.push("tcb_status_details");
     }
-    if claim.mval.extensions.is_some() {
+    if !claim.mval.extra_entries.is_empty()
+        && tcb_status_value(&claim.mval).is_none()
+        && !has_tcb_status_details(&claim.mval)
+    {
         unsupported_fields.push("extensions");
     }
     if !unsupported_fields.is_empty() {
@@ -1704,7 +1729,7 @@ fn validate_single_measurement_against_claim(
     // Each SPDM measurement claim must populate exactly one supported field.
     // Having multiple fields set (e.g., both digests and raw-value) is invalid.
     let supported_field_count = claim.mval.digests.is_some() as u8
-        + claim.mval.raw.is_some() as u8
+        + claim.mval.raw_value.is_some() as u8
         + claim.mval.svn.is_some() as u8;
 
     if supported_field_count > 1 {
@@ -1713,7 +1738,7 @@ fn validate_single_measurement_against_claim(
              Fields: digests={}, raw={}, svn={}. All set fields will be evaluated.",
             supported_field_count,
             claim.mval.digests.is_some(),
-            claim.mval.raw.is_some(),
+            claim.mval.raw_value.is_some(),
             claim.mval.svn.is_some(),
         );
     }
@@ -1726,7 +1751,7 @@ fn validate_single_measurement_against_claim(
     if let Some(ref digests) = claim.mval.digests {
         // Check if the measurement value matches any reference digest
         for reference_digest in digests {
-            let reference_bytes: &[u8] = reference_digest.val.as_ref();
+            let reference_bytes = reference_digest.value();
 
             if &measurement.value == reference_bytes {
                 return Ok(true);
@@ -1738,18 +1763,18 @@ fn validate_single_measurement_against_claim(
     }
 
     // Check raw value if present in reference claim
-    if let Some(ref raw_claim) = claim.mval.raw {
-        if let Some(raw_bytes) = raw_claim.raw_value.as_bytes() {
-            if measurement.value == raw_bytes {
+    if let Some(ref raw_claim) = claim.mval.raw_value {
+        if let corim::types::measurement::RawValueChoice::Bytes(raw_bytes) = raw_claim {
+            if measurement.value == *raw_bytes {
                 return Ok(true);
-            } else {
-                tracing::error!("Raw value mismatch");
-                return Ok(false);
             }
-        } else {
-            tracing::warn!("Reference raw value is not in bytes format");
+
+            tracing::error!("Raw value mismatch");
             return Ok(false);
         }
+
+        tracing::warn!("Reference raw value is not in bytes format");
+        return Ok(false);
     }
 
     // Check SVN if present in reference claim
@@ -1787,13 +1812,9 @@ fn validate_single_measurement_against_claim(
 /// Similar to TCBInfo validation but for measurements evolution tracking
 fn validate_measurements_against_trust_corim(
     measurements: &[spdmmeasurements::MeasurementRecord],
-    trust_corim: &Corim<'_>,
+    trust_corim: &Corim,
 ) -> Result<bool, anyhow::Error> {
-    // Extract CorimMap from the Trust CORIM
-    let corim_map: &corim_rs::CorimMap<'_> = match trust_corim {
-        corim_rs::ConciseRimTypeChoice::Unsigned(tagged) => tagged,
-        corim_rs::ConciseRimTypeChoice::Signed(signed) => &signed.corim_map,
-    };
+    let corim_map = trust_corim.corim_map();
 
     let mut measurement_series_count = 0;
 
@@ -1804,52 +1825,42 @@ fn validate_measurements_against_trust_corim(
     // Look for conditional endorsement series related to measurements
     // Design intent: there should be exactly one CES triple for the measurement environment.
     // Unlike TCBInfo (one CES per DICE layer), measurements have a single holistic trust posture.
-    for tag in &corim_map.tags {
-        if let corim_rs::ConciseTagTypeChoice::Mid(comid_tag) = tag {
-            let comid = &**comid_tag;
+    for comid in iter_comids(corim_map) {
+        if let Some(ref conditional_series) = comid.triples.conditional_endorsement_series {
+            for (series_idx, series) in conditional_series.iter().enumerate() {
+                // Check if this series is for measurements (not TCBInfo)
+                let is_measurement_series =
+                    is_spdm_measurements_record(&series.condition().environment)?;
 
-            // Check conditional endorsement series for measurements evolution tracking
-            if let Some(ref conditional_series) =
-                comid.triples.conditional_endorsement_series_triples
-            {
-                for (series_idx, series) in conditional_series.iter().enumerate() {
-                    // Check if this series is for measurements (not TCBInfo)
-                    let is_measurement_series =
-                        is_spdm_measurements_record(&series.condition.environment)?;
+                if is_measurement_series {
+                    measurement_series_count += 1;
 
-                    if is_measurement_series {
-                        measurement_series_count += 1;
-
-                        if measurement_series_count > 1 {
-                            tracing::warn!(
-                                "Multiple measurement CES triples found (series #{}).",
-                                series_idx
-                            );
-                        }
-
-                        tracing::debug!(
-                            "Processing measurements conditional endorsement series #{}",
+                    if measurement_series_count > 1 {
+                        tracing::warn!(
+                            "Multiple measurement CES triples found (series #{}).",
                             series_idx
                         );
+                    }
 
-                        // Evaluate measurements against conditional endorsement series
-                        let measurements_up_to_date =
-                            evaluate_measurements_conditional_endorsement_series(
-                                measurements,
-                                series,
-                            )?;
+                    tracing::debug!(
+                        "Processing measurements conditional endorsement series #{}",
+                        series_idx
+                    );
 
-                        if measurements_up_to_date {
-                            tracing::debug!(
-                                "Measurements are up to date according to conditional endorsement series"
-                            );
-                            return Ok(true);
-                        } else {
-                            tracing::warn!(
-                                "Measurements series #{} did not confirm up-to-date — continuing to check remaining series",
-                                series_idx
-                            );
-                        }
+                    // Evaluate measurements against conditional endorsement series
+                    let measurements_up_to_date =
+                        evaluate_measurements_conditional_endorsement_series(measurements, series)?;
+
+                    if measurements_up_to_date {
+                        tracing::debug!(
+                            "Measurements are up to date according to conditional endorsement series"
+                        );
+                        return Ok(true);
+                    } else {
+                        tracing::warn!(
+                            "Measurements series #{} did not confirm up-to-date — continuing to check remaining series",
+                            series_idx
+                        );
                     }
                 }
             }
@@ -1880,7 +1891,7 @@ fn validate_measurements_against_trust_corim(
 /// matching condition in the conditional endorsement series
 fn evaluate_measurements_conditional_endorsement_series(
     measurements: &[spdmmeasurements::MeasurementRecord],
-    series: &corim_rs::ConditionalEndorsementSeriesTripleRecord<'_>,
+    series: &ConditionalEndorsementSeriesTriple,
 ) -> Result<bool, anyhow::Error> {
 
     if measurements.is_empty() {
@@ -1891,12 +1902,12 @@ fn evaluate_measurements_conditional_endorsement_series(
     tracing::debug!(
         "Evaluating measurements conditional endorsement series: {} measurement(s), {} evolution record(s)",
         measurements.len(),
-        series.series.len()
+        series.series().len()
     );
 
     // Validate against condition environment (initial state check)
-    if !series.condition.claims_list.is_empty() {
-        for (claim_idx, claim) in series.condition.claims_list.iter().enumerate() {
+    if !series.condition().claims_list.is_empty() {
+        for (claim_idx, claim) in series.condition().claims_list.iter().enumerate() {
             let context = format!("Measurements condition #{}", claim_idx);
             if !validate_measurements_against_single_claim(measurements, claim, &context)? {
                 tracing::error!(
@@ -1910,10 +1921,10 @@ fn evaluate_measurements_conditional_endorsement_series(
 
     // Evaluate series of allowed measurement changes
     // The first series selection criteria that matches terminates series matching
-    for (_record_idx, record) in series.series.iter().enumerate() {
+    for (_record_idx, record) in series.series().iter().enumerate() {
         let mut meets_all_selections = true;
 
-        for (sel_idx, selection) in record.selection.iter().enumerate() {
+        for (sel_idx, selection) in record.selection().iter().enumerate() {
             let context = format!("Measurements selection #{}", sel_idx);
             if !validate_measurements_against_single_claim(measurements, selection, &context)? {
                 meets_all_selections = false;
@@ -1924,16 +1935,15 @@ fn evaluate_measurements_conditional_endorsement_series(
         // If selection criteria are met, this is our first match - apply endorsements and terminate
         if meets_all_selections {
             // Expect exactly one measurement map in addition with TCB status
-            if record.addition.len() != 1 {
+            if record.addition().len() != 1 {
                 anyhow::bail!(
                     "Expected exactly 1 measurement map in addition, got {}",
-                    record.addition.len()
+                    record.addition().len()
                 );
             }
 
-            let addition = &record.addition[0];
-            if let Some(ref tcb_status) = addition.mval.tcb_status {
-                let status_str = tcb_status.as_ref();
+            let addition = &record.addition()[0];
+            if let Some(status_str) = tcb_status_value(&addition.mval) {
 
                 // Parse the TCB status string and return the appropriate boolean value
                 let tcb_up_to_date = match status_str {
@@ -1953,9 +1963,9 @@ fn evaluate_measurements_conditional_endorsement_series(
                 };
 
                 return Ok(tcb_up_to_date);
-            } else {
-                anyhow::bail!("Addition measurement map missing required tcb_status field");
             }
+
+            anyhow::bail!("Addition measurement map missing required tcb_status field");
         }
     }
 
@@ -1970,7 +1980,7 @@ fn evaluate_measurements_conditional_endorsement_series(
 /// but for a single claim instead of a list of claims
 fn validate_measurements_against_single_claim(
     measurements: &[spdmmeasurements::MeasurementRecord],
-    claim: &corim_rs::MeasurementMap<'_>,
+    claim: &MeasurementMap,
     context: &str,
 ) -> Result<bool, anyhow::Error> {
     tracing::debug!(
@@ -1981,8 +1991,8 @@ fn validate_measurements_against_single_claim(
     // Check if this claim has an mkey (measurement key identifier)
     if let Some(ref mkey) = claim.mkey {
         // Extract UInt value from mkey as per documentation
-        if let corim_rs::MeasuredElementTypeChoice::UInt(uint_key) = mkey {
-            let key_value = uint_key.0 as u8;
+        if let MeasuredElement::Uint(uint_key) = mkey {
+            let key_value = *uint_key as u8;
 
             // Find matching measurement by index
             if let Some(measurement_record) =
@@ -2021,6 +2031,9 @@ fn validate_measurements_against_single_claim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ciborium::value::Value as CiboriumValue;
+    use coset::{CoseSign1, TaggedCborSerializable};
+    use std::collections::BTreeSet;
 
     /// Helper function to create a pair of minimal test CORIMs for testing purposes
     ///
@@ -2032,13 +2045,14 @@ mod tests {
     /// - Unsigned CORIM type
     ///
     /// Returns (authenticity_corim, trust_corim) tuple
-    fn create_test_corim_pair<'a>() -> Result<(Corim<'a>, Corim<'a>), anyhow::Error> {
-        use corim_rs::{
-            CertThumbprintType, ConciseMidTagBuilder, CorimEntityMapBuilder, CorimMapBuilder,
-            CorimRoleTypeChoice, CryptoKeyTypeChoice, Digest, EnvironmentMap, HashAlgorithm,
-            IdentityTripleRecord, MeasurementMap, ReferenceTripleRecord, TagIdentityMap,
-            TriplesMapBuilder,
-        };
+    fn create_test_corim_pair() -> Result<(Corim, Corim), anyhow::Error> {
+        use corim::builder::{ComidBuilder, CorimBuilder};
+        use corim::types::common::{CryptoKey, EntityMap, InstanceIdChoice, TagIdChoice};
+        use corim::types::corim::CorimId;
+        use corim::types::environment::EnvironmentMap;
+        use corim::types::measurement::{Digest, MeasurementMap, MeasurementValuesMap};
+        use corim::types::tags::{COMID_ROLE_TAG_CREATOR, CORIM_ROLE_MANIFEST_CREATOR};
+        use corim::types::triples::{IdentityTriple, ReferenceTriple};
 
         // Static string constants to avoid lifetime issues
         #[allow(dead_code)]
@@ -2054,137 +2068,705 @@ mod tests {
         ];
 
         // Create identity triple with certificate thumbprint for authenticity CORIM
-        let cert_thumbprint = CertThumbprintType(ciborium::tag::Accepted(Digest {
-            alg: HashAlgorithm::Sha384,
-            val: corim_rs::Bytes::from(root_thumbprint.as_slice()),
-        }));
-
-        let identity_triple = IdentityTripleRecord {
-            environment: EnvironmentMap {
+        let identity_triple = IdentityTriple::new(
+            EnvironmentMap {
                 class: None,
-                instance: Some(corim_rs::InstanceIdTypeChoice::Bytes(
-                    corim_rs::TaggedBytes::from(b"SPDM_certificate".as_slice()),
-                )),
+                instance: Some(InstanceIdChoice::Bytes(b"SPDM_certificate".to_vec())),
                 group: None,
             },
-            key_list: vec![CryptoKeyTypeChoice::CertThumbprint(cert_thumbprint)],
-            conditions: None,
-        };
+            vec![CryptoKey::CertThumbprint(Digest::new(
+                SHA384_ALG_ID,
+                root_thumbprint.to_vec(),
+            ))],
+            None,
+        );
 
         // Create minimal reference triple for both CORIMs
-        let reference_triple = ReferenceTripleRecord {
-            ref_env: EnvironmentMap {
+        let reference_triple = ReferenceTriple::new(
+            EnvironmentMap {
                 class: None,
-                instance: None,
+                instance: Some(InstanceIdChoice::Bytes(b"test-reference".to_vec())),
                 group: None,
             },
-            ref_claims: vec![MeasurementMap {
+            vec![MeasurementMap {
                 mkey: None,
-                mval: corim_rs::MeasurementValuesMapBuilder::new()
-                    .digest(vec![Digest {
-                        alg: corim_rs::HashAlgorithm::Sha256,
-                        val: corim_rs::Bytes::from([0u8; 32].as_slice()),
-                    }])
-                    .build()
-                    .context("Failed to build minimal measurement values")?,
+                mval: MeasurementValuesMap {
+                    digests: Some(vec![Digest::new(SHA256_ALG_ID, vec![0u8; 32])]),
+                    ..MeasurementValuesMap::default()
+                },
                 authorized_by: None,
             }],
-        };
+        );
 
         // Create authenticity CoMID tag with identity triple and reference triple
-        let authenticity_comid_tag = ConciseMidTagBuilder::new()
-            .tag_identity(TagIdentityMap {
-                tag_id: "authenticity-tag".into(),
-                tag_version: Some(1.into()),
+        let authenticity_comid_tag = ComidBuilder::new(TagIdChoice::Text("authenticity-tag".into()))
+            .set_tag_version(1)
+            .add_entity(EntityMap {
+                entity_name: ENTITY_NAME.into(),
+                reg_id: None,
+                role: vec![COMID_ROLE_TAG_CREATOR],
             })
-            .triples(
-                TriplesMapBuilder::new()
-                    .identity_triples(vec![identity_triple])
-                    .reference_triples(vec![reference_triple.clone()])
-                    .build()
-                    .context("Failed to build authenticity triples map")?,
-            )
+            .add_identity_triple(identity_triple)
+            .add_reference_triple(reference_triple.clone())
             .build()
             .context("Failed to build authenticity CoMID tag")?;
 
         // Create trust CoMID tag with only reference triple (no identity triple)
-        let trust_comid_tag = ConciseMidTagBuilder::new()
-            .tag_identity(TagIdentityMap {
-                tag_id: "trust-tag".into(),
-                tag_version: Some(1.into()),
+        let trust_comid_tag = ComidBuilder::new(TagIdChoice::Text("trust-tag".into()))
+            .set_tag_version(1)
+            .add_entity(EntityMap {
+                entity_name: ENTITY_NAME.into(),
+                reg_id: None,
+                role: vec![COMID_ROLE_TAG_CREATOR],
             })
-            .triples(
-                TriplesMapBuilder::new()
-                    .reference_triples(vec![reference_triple])
-                    .build()
-                    .context("Failed to build trust triples map")?,
-            )
+            .add_reference_triple(reference_triple)
             .build()
             .context("Failed to build trust CoMID tag")?;
 
         // Create authenticity CORIM with identity triple
-        let authenticity_corim_map = CorimMapBuilder::new()
-            .id("test-corim-authenticity".into())
-            .add_entity(
-                CorimEntityMapBuilder::new()
-                    .entity_name(ENTITY_NAME.into())
-                    .add_role(CorimRoleTypeChoice::ManifestCreator)
-                    .build()
-                    .context("Failed to build authenticity entity")?,
-            )
-            .add_tag(authenticity_comid_tag.into())
-            .build()
-            .context("Failed to build authenticity CORIM map")?;
+        let authenticity_corim_map = CorimBuilder::new(CorimId::Text(
+            format!("{}-authenticity", CORIM_ID_BASE).into(),
+        ))
+        .add_entity(EntityMap {
+            entity_name: ENTITY_NAME.into(),
+            reg_id: None,
+            role: vec![CORIM_ROLE_MANIFEST_CREATOR],
+        })
+        .add_comid_tag(authenticity_comid_tag)?
+        .build()
+        .context("Failed to build authenticity CORIM map")?;
 
         // Create trust CORIM without identity triple
-        let trust_corim_map = CorimMapBuilder::new()
-            .id("test-corim-trust".into())
-            .add_entity(
-                CorimEntityMapBuilder::new()
-                    .entity_name(ENTITY_NAME.into())
-                    .add_role(CorimRoleTypeChoice::ManifestCreator)
-                    .build()
-                    .context("Failed to build trust entity")?,
-            )
-            .add_tag(trust_comid_tag.into())
-            .build()
-            .context("Failed to build trust CORIM map")?;
+        let trust_corim_map = CorimBuilder::new(CorimId::Text(
+            format!("{}-trust", CORIM_ID_BASE).into(),
+        ))
+        .add_entity(EntityMap {
+            entity_name: ENTITY_NAME.into(),
+            reg_id: None,
+            role: vec![CORIM_ROLE_MANIFEST_CREATOR],
+        })
+        .add_comid_tag(trust_comid_tag)?
+        .build()
+        .context("Failed to build trust CORIM map")?;
 
         // Create CORIMs (unsigned)
-        let authenticity_corim =
-            corim_rs::ConciseRimTypeChoice::Unsigned(authenticity_corim_map.into());
-        let trust_corim = corim_rs::ConciseRimTypeChoice::Unsigned(trust_corim_map.into());
+        let authenticity_corim = Corim::Unsigned(authenticity_corim_map);
+        let trust_corim = Corim::Unsigned(trust_corim_map);
 
         Ok((authenticity_corim, trust_corim))
     }
     use futures_executor::block_on;
 
     /// Helper function to parse CORIM from CBOR data (for testing only)  
-    fn parse_corim_from_cbor(cbor_data: &[u8]) -> Result<Corim<'_>, String> {
-        use coset::{CoseSign1, TaggedCborSerializable};
+    fn parse_corim_from_cbor(cbor_data: &[u8]) -> Result<Corim, String> {
+        super::parse_corim_from_cbor(cbor_data).map_err(|e| e.to_string())
+    }
 
-        // First try to parse as COSE-wrapped CoRIM (signed)
-        match CoseSign1::from_tagged_slice(cbor_data) {
-            Ok(cose_sign1) => {
-                if let Some(payload) = &cose_sign1.payload {
-                    // Parse the inner CorimMap from COSE payload
-                    let corim_map: corim_rs::CorimMap<'_> =
-                        ciborium::de::from_reader(payload.as_slice()).map_err(|e| {
-                            format!("Failed to parse COSE payload as CorimMap: {}", e)
-                        })?;
-                    // Wrap in the Unsigned variant since it's extracted from COSE
-                    Ok(corim_rs::ConciseRimTypeChoice::Unsigned(corim_map.into()))
-                } else {
-                    Err("COSE structure missing payload".to_string())
-                }
+    fn print_corim_cose(cbor_data: &[u8]) -> Result<(), anyhow::Error> {
+        let cose = CoseSign1::from_tagged_slice(cbor_data)
+            .context("Failed to parse input as COSE Sign1")?;
+
+        println!("COSE Sign1 envelope:");
+        println!("  protected headers: {:#?}", cose.protected.header);
+        println!("  unprotected headers: {:#?}", cose.unprotected);
+        println!(
+            "  payload bytes: {}",
+            cose.payload.as_ref().map_or(0, Vec::len)
+        );
+        println!("  signature bytes: {}", cose.signature.len());
+
+        let payload = cose
+            .payload
+            .as_deref()
+            .context("COSE Sign1 payload is missing")?;
+
+        let payload_value: CiboriumValue = ciborium::de::from_reader(payload)
+            .context("Failed to decode COSE payload as CBOR value")?;
+        println!("COSE payload CBOR:");
+        println!("{:#?}", payload_value);
+
+        let parsed_corim = super::parse_corim_from_cbor(cbor_data)?;
+        match parsed_corim {
+            Corim::Signed(ref signed) => {
+                println!("Parsed CoRIM: signed");
+                println!("  id: {:?}", signed.corim_map.id);
+                println!("  tags: {}", signed.corim_map.tags.len());
+                println!(
+                    "  entities: {}",
+                    signed.corim_map.entities.as_ref().map_or(0, Vec::len)
+                );
             }
-            Err(_) => {
-                // If COSE parsing fails, try as unsigned CBOR CoRIM
-                let corim_map: corim_rs::CorimMap<'_> = ciborium::de::from_reader(cbor_data)
-                    .map_err(|e| format!("Failed to parse unsigned CBOR as CorimMap: {}", e))?;
-                Ok(corim_rs::ConciseRimTypeChoice::Unsigned(corim_map.into()))
+            Corim::Unsigned(ref unsigned) => {
+                println!("Parsed CoRIM: unsigned");
+                println!("  id: {:?}", unsigned.id);
+                println!("  tags: {}", unsigned.tags.len());
+                println!(
+                    "  entities: {}",
+                    unsigned.entities.as_ref().map_or(0, Vec::len)
+                );
             }
         }
+
+        Ok(())
+    }
+
+    fn print_parsed_corim(label: &str, corim: &Corim) {
+        fn print_measurement_values_map(prefix: &str, mval: &MeasurementValuesMap) {
+            fn print_field<T: std::fmt::Debug>(prefix: &str, name: &str, value: &T) {
+                println!("{}{}: {:#?}", prefix, name, value);
+            }
+
+            println!("{}MeasurementValuesMap {{", prefix);
+            print_field(prefix, "  version", &mval.version);
+            print_field(prefix, "  svn", &mval.svn);
+
+            match &mval.digests {
+                Some(digests) => {
+                    println!("{}  digests: Some([", prefix);
+                    for Digest(alg, bytes) in digests {
+                        println!(
+                            "{}    Digest({}, \"{}\"),",
+                            prefix,
+                            alg,
+                            hex::encode(bytes)
+                        );
+                    }
+                    println!("{}  ])", prefix);
+                }
+                None => println!("{}  digests: None", prefix),
+            }
+
+            print_field(prefix, "  flags", &mval.flags);
+            print_field(prefix, "  raw_value", &mval.raw_value);
+            print_field(prefix, "  mac_addr", &mval.mac_addr);
+            print_field(prefix, "  ip_addr", &mval.ip_addr);
+            print_field(prefix, "  serial_number", &mval.serial_number);
+            print_field(prefix, "  ueid", &mval.ueid);
+            print_field(prefix, "  uuid", &mval.uuid);
+            print_field(prefix, "  name", &mval.name);
+            print_field(prefix, "  cryptokeys", &mval.cryptokeys);
+            print_field(prefix, "  integrity_registers", &mval.integrity_registers);
+            print_field(prefix, "  int_range", &mval.int_range);
+            print_field(prefix, "  extra_entries", &mval.extra_entries);
+            println!("{}}}", prefix);
+        }
+
+        fn print_measurement_map(prefix: &str, measurement: &MeasurementMap) {
+            println!("{}mkey: {:?}", prefix, measurement.mkey);
+            println!("{}mval:", prefix);
+            print_measurement_values_map(&format!("{}  ", prefix), &measurement.mval);
+            if let Some(authorized_by) = &measurement.authorized_by {
+                println!("{}authorized_by: {:#?}", prefix, authorized_by);
+            }
+        }
+
+        fn print_comid_triples(prefix: &str, comid: &ComidTag) {
+            println!("{}tag_identity: {:#?}", prefix, comid.tag_identity);
+            println!("{}entities: {:#?}", prefix, comid.entities);
+
+            match &comid.triples.identity_triples {
+                Some(identity_triples) => {
+                    println!("{}identity_triples:", prefix);
+                    for (index, triple) in identity_triples.iter().enumerate() {
+                        println!("{}  [{}] environment: {:#?}", prefix, index, triple.0);
+                        println!("{}  [{}] key_list: {:#?}", prefix, index, triple.1);
+                        println!("{}  [{}] conditions: {:#?}", prefix, index, triple.2);
+                    }
+                }
+                None => println!("{}identity_triples: <none>", prefix),
+            }
+
+            match &comid.triples.reference_triples {
+                Some(reference_triples) => {
+                    println!("{}reference_triples:", prefix);
+                    for (triple_index, triple) in reference_triples.iter().enumerate() {
+                        println!("{}  [{}] environment: {:#?}", prefix, triple_index, triple.environment());
+                        for (measurement_index, measurement) in triple.measurements().iter().enumerate() {
+                            println!("{}    measurement[{}]:", prefix, measurement_index);
+                            print_measurement_map(&format!("{}      ", prefix), measurement);
+                        }
+                    }
+                }
+                None => println!("{}reference_triples: <none>", prefix),
+            }
+
+            match &comid.triples.conditional_endorsement_series {
+                Some(series_triples) => {
+                    println!("{}conditional_endorsement_series:", prefix);
+                    for (series_index, series) in series_triples.iter().enumerate() {
+                        println!("{}  [{}] condition.environment: {:#?}", prefix, series_index, series.condition().environment);
+                        println!("{}  [{}] condition.authorized_by: {:#?}", prefix, series_index, series.condition().authorized_by);
+                        println!("{}  [{}] condition.claims_list:", prefix, series_index);
+                        for (claim_index, claim) in series.condition().claims_list.iter().enumerate() {
+                            println!("{}    claim[{}]:", prefix, claim_index);
+                            print_measurement_map(&format!("{}      ", prefix), claim);
+                        }
+
+                        for (record_index, record) in series.series().iter().enumerate() {
+                            println!("{}  [{}] record[{}].selection:", prefix, series_index, record_index);
+                            for (selection_index, selection) in record.selection().iter().enumerate() {
+                                println!("{}    selection[{}]:", prefix, selection_index);
+                                print_measurement_map(&format!("{}      ", prefix), selection);
+                            }
+
+                            println!("{}  [{}] record[{}].addition:", prefix, series_index, record_index);
+                            for (addition_index, addition) in record.addition().iter().enumerate() {
+                                println!("{}    addition[{}]:", prefix, addition_index);
+                                print_measurement_map(&format!("{}      ", prefix), addition);
+                            }
+                        }
+                    }
+                }
+                None => println!("{}conditional_endorsement_series: <none>", prefix),
+            }
+        }
+
+        println!("=== {} ===", label);
+        match corim {
+            Corim::Signed(signed) => {
+                println!("kind: signed");
+                println!("corim id: {:?}", signed.corim_map.id);
+                println!("entities: {:#?}", signed.corim_map.entities);
+                println!("tag_count: {}", signed.corim_map.tags.len());
+                for (index, comid) in iter_comids(&signed.corim_map).enumerate() {
+                    println!("comid[{}]:", index);
+                    print_comid_triples("  ", &comid);
+                }
+            }
+            Corim::Unsigned(unsigned) => {
+                println!("kind: unsigned");
+                println!("corim id: {:?}", unsigned.id);
+                println!("entities: {:#?}", unsigned.entities);
+                println!("tag_count: {}", unsigned.tags.len());
+                for (index, comid) in iter_comids(unsigned).enumerate() {
+                    println!("comid[{}]:", index);
+                    print_comid_triples("  ", &comid);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn print_sfua_endors_cose() {
+        let cose_bytes = include_bytes!("sfua-endors.cose");
+
+        print_corim_cose(cose_bytes).expect("Failed to print sfua-endors.cose");
+    }
+
+    #[test]
+    fn test_sfua_sample_signer_has_expected_x5chain_details() {
+        let cose_bytes = include_bytes!("test_endors/corim-tdisp-sfua-endrs-ovl3-signed.cose");
+        let cose = CoseSign1::from_tagged_slice(cose_bytes)
+            .expect("failed to parse SFUA COSE envelope for header inspection");
+
+        println!("SFUA COSE protected headers: {:#?}", cose.protected.header);
+        println!("SFUA COSE unprotected headers: {:#?}", cose.unprotected);
+
+        let (root_ca_thumbprint, leaf_cert_subject_name, chain_certs) =
+            sfua_signer_x5chain_details(cose_bytes).expect("Failed to inspect signed SFUA signer certificates");
+
+        assert_eq!(
+            root_ca_thumbprint,
+            "754bbc1d30028c4a05b5753c953e71bc502d72d0",
+            "SFUA signer should carry the expected root CA thumbprint in its x5chain"
+        );
+        assert_eq!(
+            leaf_cert_subject_name,
+            "C=US, ST=Washington, L=Redmond, O=Microsoft Corporation, CN=Microsoft Cloud Server Overlake Trusted Endorsement",
+            "SFUA signer should carry the expected leaf signing certificate subject"
+        );
+
+        println!("x5chain certificate validity periods:");
+        for (i, cert) in chain_certs.iter().enumerate() {
+            println!(
+                "  cert[{}]: not_before={}, not_after={}",
+                i,
+                cert.not_before(),
+                cert.not_after()
+            );
+        }
+    }
+
+    fn first_comid(corim: &Corim) -> ComidTag {
+        let comids: Vec<_> = iter_comids(corim.corim_map()).collect();
+        assert_eq!(comids.len(), 1, "expected exactly one CoMID tag");
+        comids.into_iter().next().expect("missing CoMID tag")
+    }
+
+    fn value_contains_text(value: &Value, needle: &str) -> bool {
+        match value {
+            Value::Text(text) => text == needle,
+            Value::Array(values) => values.iter().any(|value| value_contains_text(value, needle)),
+            Value::Map(entries) => entries.iter().any(|(key, value)| {
+                value_contains_text(key, needle) || value_contains_text(value, needle)
+            }),
+            _ => false,
+        }
+    }
+
+    fn ciborium_map_get_text<'a>(
+        entries: &'a [(CiboriumValue, CiboriumValue)],
+        key: &str,
+    ) -> Option<&'a CiboriumValue> {
+        entries.iter().find_map(|(entry_key, entry_value)| match entry_key {
+            CiboriumValue::Text(text) if text == key => Some(entry_value),
+            _ => None,
+        })
+    }
+
+    fn ciborium_map_get_int<'a>(
+        entries: &'a [(CiboriumValue, CiboriumValue)],
+        key: i128,
+    ) -> Option<&'a CiboriumValue> {
+        entries.iter().find_map(|(entry_key, entry_value)| match entry_key {
+            CiboriumValue::Integer(integer)
+                if i128::try_from(integer.clone()).ok() == Some(key) =>
+            {
+                Some(entry_value)
+            }
+            _ => None,
+        })
+    }
+
+    fn ciborium_uint_eq(value: &CiboriumValue, expected: u64) -> bool {
+        match value {
+            CiboriumValue::Integer(integer) => u64::try_from(integer.clone()).ok() == Some(expected),
+            _ => false,
+        }
+    }
+
+    fn protected_header_has_cwt_svn(
+        cose_bytes: &[u8],
+        expected_svn: u64,
+    ) -> Result<bool, anyhow::Error> {
+        let cose_value: CiboriumValue = ciborium::de::from_reader(cose_bytes)
+            .context("failed to decode SFUA sample as CBOR")?;
+
+        let protected_bytes = match cose_value {
+            CiboriumValue::Tag(18, tagged) => match *tagged {
+                CiboriumValue::Array(elements) if elements.len() == 4 => match &elements[0] {
+                    CiboriumValue::Bytes(bytes) => bytes.clone(),
+                    _ => anyhow::bail!("COSE Sign1 protected header is not encoded as a bstr"),
+                },
+                _ => anyhow::bail!("COSE Sign1 payload is not a 4-element array"),
+            },
+            _ => anyhow::bail!("SFUA sample is not a tagged COSE Sign1 structure"),
+        };
+
+        let protected_value: CiboriumValue = ciborium::de::from_reader(protected_bytes.as_slice())
+            .context("failed to decode protected header map")?;
+
+        let protected_map = match protected_value {
+            CiboriumValue::Map(entries) => entries,
+            _ => anyhow::bail!("COSE protected header is not a CBOR map"),
+        };
+
+        let has_expected_svn = |claims: &CiboriumValue| match claims {
+            CiboriumValue::Map(entries) => ciborium_map_get_text(entries, "svn")
+                .is_some_and(|svn| ciborium_uint_eq(svn, expected_svn)),
+            _ => false,
+        };
+
+        if let Some(cwt_claims) = ciborium_map_get_text(&protected_map, "CWT-Claims") {
+            return Ok(has_expected_svn(cwt_claims));
+        }
+
+        Ok(protected_map.iter().any(|(_, value)| has_expected_svn(value)))
+    }
+
+    fn sfua_signer_x5chain_details(
+        cose_bytes: &[u8],
+    ) -> Result<(String, String, Vec<X509>), anyhow::Error> {
+        use openssl::hash::{hash, MessageDigest};
+
+        let cose_value: CiboriumValue = ciborium::de::from_reader(cose_bytes)
+            .context("failed to decode SFUA sample as CBOR")?;
+
+        let (protected_bytes, unprotected_map) = match cose_value {
+            CiboriumValue::Tag(18, tagged) => match *tagged {
+                CiboriumValue::Array(elements) if elements.len() == 4 => {
+                    let protected_bytes = match &elements[0] {
+                        CiboriumValue::Bytes(bytes) => bytes.clone(),
+                        _ => anyhow::bail!("COSE Sign1 protected header is not encoded as a bstr"),
+                    };
+                    let unprotected_map = match &elements[1] {
+                        CiboriumValue::Map(entries) => entries.clone(),
+                        _ => anyhow::bail!("COSE Sign1 unprotected header is not a CBOR map"),
+                    };
+
+                    (protected_bytes, unprotected_map)
+                }
+                _ => anyhow::bail!("COSE Sign1 payload is not a 4-element array"),
+            },
+            _ => anyhow::bail!("SFUA sample is not a tagged COSE Sign1 structure"),
+        };
+
+        let protected_map: Vec<(CiboriumValue, CiboriumValue)> =
+            match ciborium::de::from_reader(protected_bytes.as_slice())
+                .context("failed to decode protected header map")?
+            {
+                CiboriumValue::Map(entries) => entries,
+                _ => anyhow::bail!("COSE protected header is not a CBOR map"),
+            };
+
+        let x5chain_value = ciborium_map_get_int(&unprotected_map, 33)
+            .or_else(|| ciborium_map_get_text(&unprotected_map, "x5chain"))
+            .or_else(|| ciborium_map_get_int(&protected_map, 33))
+            .or_else(|| ciborium_map_get_text(&protected_map, "x5chain"))
+            .context("SFUA sample does not carry an x5chain COSE header")?;
+
+        let cert_chain = match x5chain_value {
+            CiboriumValue::Bytes(cert) => vec![cert.clone()],
+            CiboriumValue::Array(values) => values
+                .iter()
+                .map(|value| match value {
+                    CiboriumValue::Bytes(cert) => Ok(cert.clone()),
+                    _ => anyhow::bail!("x5chain contains a non-byte-string certificate entry"),
+                })
+                .collect::<Result<Vec<_>, anyhow::Error>>()?,
+            other => anyhow::bail!("unexpected x5chain header encoding: {:?}", other),
+        };
+
+        let leaf_cert_der = cert_chain
+            .first()
+            .context("x5chain is empty - missing leaf certificate")?;
+        let root_cert_der = cert_chain
+            .last()
+            .context("x5chain is empty - missing root certificate")?;
+
+        let leaf_cert = X509::from_der(leaf_cert_der)
+            .context("failed to parse leaf certificate from x5chain")?;
+        let root_thumbprint = hash(MessageDigest::sha1(), root_cert_der)
+            .context("failed to hash root certificate thumbprint")?;
+
+        let leaf_subject_name = leaf_cert
+            .subject_name()
+            .entries()
+            .map(|entry| {
+                let short_name = entry.object().nid().short_name().unwrap_or("?");
+                let value = entry
+                    .data()
+                    .as_utf8()
+                    .map(|text| text.to_string())
+                    .unwrap_or_else(|_| hex::encode(entry.data().as_slice()));
+                format!("{}={}", short_name, value)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let chain_certs = cert_chain
+            .iter()
+            .map(|der| X509::from_der(der).context("failed to parse certificate from x5chain"))
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+
+        Ok((hex::encode(root_thumbprint), leaf_subject_name, chain_certs))
+    }
+
+    fn uint_mkeys(measurements: &[MeasurementMap]) -> BTreeSet<u64> {
+        measurements
+            .iter()
+            .filter_map(|measurement| match measurement.mkey {
+                Some(MeasuredElement::Uint(value)) => Some(value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ces_tracked_mkeys(series: &[ConditionalEndorsementSeriesTriple]) -> BTreeSet<u64> {
+        let mut keys = BTreeSet::new();
+
+        for triple in series {
+            keys.extend(uint_mkeys(&triple.condition().claims_list));
+            for record in triple.series() {
+                keys.extend(uint_mkeys(record.selection()));
+                keys.extend(uint_mkeys(record.addition()));
+            }
+        }
+
+        keys
+    }
+
+    #[test]
+    fn test_sfua_sample_endorsement_has_expected_verifier_inputs() {
+        let cose_bytes = include_bytes!("test_endors/corim-tdisp-sfua-endrs-ovl3-signed.cose");
+        CoseSign1::from_tagged_slice(cose_bytes).expect("failed to parse SFUA COSE envelope");
+        assert!(
+            protected_header_has_cwt_svn(cose_bytes, 1)
+                .expect("failed to inspect SFUA protected header CWT claims"),
+            "SFUA sample should carry CWT svn=1 in the COSE protected header"
+        );
+
+        let corim = parse_corim_from_cbor(cose_bytes).expect("failed to parse SFUA sample");
+        print_parsed_corim("SFUA endorsement", &corim);
+        assert!(
+            matches!(corim, Corim::Signed(_)),
+            "SFUA sample should be a signed COSE-wrapped CoRIM"
+        );
+
+        let comid = first_comid(&corim);
+
+        let identity_triples = comid
+            .triples
+            .identity_triples
+            .as_ref()
+            .expect("SFUA sample should carry identity triples");
+        assert!(
+            identity_triples.len() == 1,
+            "SFUA sample should contain exactly one identity triple, got {}",
+            identity_triples.len()
+        );
+        let cert_thumbprint_count = identity_triples[0]
+            .1
+            .iter()
+            .filter(|key| matches!(key, CryptoKey::CertThumbprint(_)))
+            .count();
+        assert!(
+            cert_thumbprint_count == 2,
+            "SFUA sample should carry exactly two certificate thumbprints in its identity triple, got {}",
+            cert_thumbprint_count
+        );
+
+        assert!(
+            comid.triples.reference_triples.is_none(),
+            "Current SFUA sample is expected to omit reference triples"
+        );
+
+        let conditional_series = comid
+            .triples
+            .conditional_endorsement_series
+            .as_ref()
+            .expect("SFUA sample should carry conditional endorsement series");
+        assert_eq!(
+            conditional_series.len(),
+            3,
+            "SFUA sample should contain exactly three CES triples"
+        );
+
+        let layer_series: BTreeSet<u64> = conditional_series
+            .iter()
+            .filter_map(|series| {
+                series
+                    .condition()
+                    .environment
+                    .class
+                    .as_ref()
+                    .and_then(|class| class.layer)
+            })
+            .collect();
+        assert!(
+            layer_series == BTreeSet::from([0, 1]),
+            "SFUA sample should carry layer 0 and layer 1 TCB CES triples, got {:?}",
+            layer_series
+        );
+
+        let measurement_series: Vec<_> = conditional_series
+            .iter()
+            .filter(|series| is_spdm_measurements_record(&series.condition().environment).unwrap_or(false))
+            .collect();
+        assert_eq!(
+            measurement_series.len(),
+            1,
+            "SFUA sample should contain exactly one SPDM measurements CES triple"
+        );
+
+        let measurement_instance = match &measurement_series[0].condition().environment.instance {
+            Some(InstanceIdChoice::Bytes(bytes)) => bytes.as_slice(),
+            other => panic!("SFUA measurement CES should carry a byte-string instance, got {:?}", other),
+        };
+        assert_eq!(
+            measurement_instance,
+            b"SPDM Measurements",
+            "SFUA measurement CES should target the 'SPDM Measurements' instance"
+        );
+
+        let tracked_mkeys = ces_tracked_mkeys(std::slice::from_ref(measurement_series[0]));
+        assert!(
+            tracked_mkeys == BTreeSet::from([1, 8, 15, 16, 17, 18, 254]),
+            "SFUA sample should track measurement indexes 1, 8, 15, 16, 17, 18, and 254 in its SPDM CES policy, got {:?}",
+            tracked_mkeys
+        );
+    }
+
+    #[test]
+    fn test_socmana_sample_endorsement_matches_block_19_design() {
+        let cbor_bytes = include_bytes!("test_endors/socmana.cbor");
+
+        let corim = parse_corim_from_cbor(cbor_bytes).expect("failed to parse SoC Mana sample");
+        print_parsed_corim("SoC Mana endorsement", &corim);
+        assert!(
+            matches!(corim, Corim::Unsigned(_)),
+            "SoC Mana sample should be a tagged unsigned CoRIM"
+        );
+
+        let comid = first_comid(&corim);
+        assert!(
+            comid.triples.identity_triples.is_none(),
+            "SoC Mana sample should not carry certificate identity triples"
+        );
+        assert!(
+            comid.triples.reference_triples.is_none(),
+            "SoC Mana sample should not carry exact-match reference triples"
+        );
+
+        let conditional_series = comid
+            .triples
+            .conditional_endorsement_series
+            .as_ref()
+            .expect("SoC Mana sample should carry conditional endorsement series");
+        assert_eq!(
+            conditional_series.len(),
+            1,
+            "SoC Mana sample should contain one CES triple"
+        );
+
+        let series = &conditional_series[0];
+        let class = series
+            .condition()
+            .environment
+            .class
+            .as_ref()
+            .expect("SoC Mana CES condition should have a class map");
+        assert_eq!(class.vendor.as_deref(), Some("Microsoft"));
+        assert!(
+            series.condition().claims_list.is_empty(),
+            "SoC Mana CES condition should not require baseline claims"
+        );
+        assert_eq!(
+            ces_tracked_mkeys(conditional_series),
+            BTreeSet::from([19]),
+            "SoC Mana sample should only track measurement index 19"
+        );
+
+        assert_eq!(
+            series.series().len(),
+            1,
+            "SoC Mana sample should contain one selection/addition record"
+        );
+
+        let record = &series.series()[0];
+        assert_eq!(
+            record.selection().len(),
+            1,
+            "SoC Mana selection should target exactly one measurement block"
+        );
+
+        let selection = &record.selection()[0];
+        assert!(matches!(selection.mkey, Some(MeasuredElement::Uint(19))));
+        assert!(matches!(selection.mval.svn, Some(SvnChoice::MinValue(1))));
+
+        assert_eq!(
+            record.addition().len(),
+            1,
+            "SoC Mana addition should contain exactly one status map"
+        );
+        assert!(
+            record.addition()[0]
+                .mval
+                .extra_entries
+                .values()
+                .any(|value| value_contains_text(value, "UpToDate")),
+            "SoC Mana addition should carry an UpToDate status value"
+        );
     }
 
     #[test]
@@ -2569,16 +3151,14 @@ mod tests {
     /// - Condition: blocks 15–20, each with min-value SVN >= 0
     /// - CSR[0] (Current): blocks 15–20, each with min-value SVN >= 1 → UpToDate
     /// - CSR[1] (Catch-all): blocks 15–20, each with min-value SVN >= 0 → OutOfDate
-    fn build_ovl3_spdm_trust_corim<'a>() -> Corim<'a> {
-        use corim_rs::{
-            ConditionalEndorsementSeriesTripleRecord, ConditionalSeriesRecord,
-            ConciseMidTagBuilder, CorimEntityMapBuilder, CorimMapBuilder,
-            CorimRoleTypeChoice, EnvironmentMap, InstanceIdTypeChoice,
-            Integer, MeasurementMap, MeasurementValuesMapBuilder,
-            MeasuredElementTypeChoice, MinSvnType, StatefulEnvironmentRecord,
-            SvnTypeChoice, TagIdentityMap, TaggedBytes, TriplesMapBuilder, Uint,
-        };
-        use std::borrow::Cow;
+    fn build_ovl3_spdm_trust_corim() -> Corim {
+        use corim::builder::{ComidBuilder, CorimBuilder};
+        use corim::types::common::{EntityMap, InstanceIdChoice, MeasuredElement, TagIdChoice};
+        use corim::types::corim::CorimId;
+        use corim::types::environment::EnvironmentMap;
+        use corim::types::measurement::{MeasurementMap, MeasurementValuesMap, SvnChoice};
+        use corim::types::tags::{COMID_ROLE_TAG_CREATOR, CORIM_ROLE_MANIFEST_CREATOR};
+        use corim::types::triples::{CesCondition, ConditionalEndorsementSeriesTriple, ConditionalSeriesRecord};
 
         let spdm_instance = base64::engine::general_purpose::STANDARD
             .encode("SPDMMeasurement");
@@ -2586,17 +3166,15 @@ mod tests {
         let block_indices: [u8; 6] = [15, 16, 17, 18, 19, 20];
 
         // Helper: build a Vec<MeasurementMap> with one entry per block, each carrying min-value SVN >= threshold
-        let make_claims = |threshold: i128| -> Vec<MeasurementMap<'a>> {
+        let make_claims = |threshold: u64| -> Vec<MeasurementMap> {
             block_indices
                 .iter()
                 .map(|&idx| MeasurementMap {
-                    mkey: Some(MeasuredElementTypeChoice::UInt(Uint::from(idx as u64))),
-                    mval: MeasurementValuesMapBuilder::new()
-                        .svn(SvnTypeChoice::TaggedMinSvn(MinSvnType::from(Integer(
-                            threshold,
-                        ))))
-                        .build()
-                        .expect("build mval"),
+                    mkey: Some(MeasuredElement::Uint(idx as u64)),
+                    mval: MeasurementValuesMap {
+                        svn: Some(SvnChoice::MinValue(threshold)),
+                        ..MeasurementValuesMap::default()
+                    },
                     authorized_by: None,
                 })
                 .collect()
@@ -2605,24 +3183,30 @@ mod tests {
         // Condition environment
         let condition_env = EnvironmentMap {
             class: None,
-            instance: Some(InstanceIdTypeChoice::Bytes(TaggedBytes::from(
-                spdm_instance.as_bytes(),
-            ))),
+            instance: Some(InstanceIdChoice::Bytes(spdm_instance.into_bytes())),
             group: None,
         };
 
         // Condition claims: all blocks SVN >= 0 (baseline)
-        let condition = StatefulEnvironmentRecord::new(condition_env, make_claims(0));
+        let condition = CesCondition {
+            environment: condition_env,
+            claims_list: make_claims(0),
+            authorized_by: None,
+        };
 
         // CSR 0: Current — all blocks SVN >= 1 → UpToDate
         let up_to_date = ConditionalSeriesRecord::new(
             make_claims(1),
             vec![MeasurementMap {
                 mkey: None,
-                mval: MeasurementValuesMapBuilder::new()
-                    .tcb_status(Cow::from("UpToDate"))
-                    .build()
-                    .expect("build addition mval"),
+                mval: MeasurementValuesMap {
+                    extra_entries: std::iter::once((
+                        corim::profile::intel::MVAL_TEE_TCBSTATUS,
+                        Value::Text("UpToDate".into()),
+                    ))
+                    .collect(),
+                    ..MeasurementValuesMap::default()
+                },
                 authorized_by: None,
             }],
         );
@@ -2632,47 +3216,46 @@ mod tests {
             make_claims(0),
             vec![MeasurementMap {
                 mkey: None,
-                mval: MeasurementValuesMapBuilder::new()
-                    .tcb_status(Cow::from("OutOfDate"))
-                    .build()
-                    .expect("build addition mval"),
+                mval: MeasurementValuesMap {
+                    extra_entries: std::iter::once((
+                        corim::profile::intel::MVAL_TEE_TCBSTATUS,
+                        Value::Text("OutOfDate".into()),
+                    ))
+                    .collect(),
+                    ..MeasurementValuesMap::default()
+                },
                 authorized_by: None,
             }],
         );
 
-        let ces_triple = ConditionalEndorsementSeriesTripleRecord::new(
+        let ces_triple = ConditionalEndorsementSeriesTriple::new(
             condition,
             vec![up_to_date, out_of_date],
         );
 
-        let comid_tag = ConciseMidTagBuilder::new()
-            .tag_identity(TagIdentityMap {
-                tag_id: "ovl3-spdm-trust-v1".into(),
-                tag_version: Some(1.into()),
+        let comid_tag = ComidBuilder::new(TagIdChoice::Text("ovl3-spdm-trust-v1".into()))
+            .set_tag_version(1)
+            .add_entity(EntityMap {
+                entity_name: "Test".into(),
+                reg_id: None,
+                role: vec![COMID_ROLE_TAG_CREATOR],
             })
-            .triples(
-                TriplesMapBuilder::new()
-                    .conditional_endorsement_series_triples(vec![ces_triple])
-                    .build()
-                    .expect("build triples"),
-            )
+            .add_conditional_endorsement_series(ces_triple)
             .build()
             .expect("build comid");
 
-        let corim_map = CorimMapBuilder::new()
-            .id("OVL3_TDISP_Trust_SVN".into())
-            .add_entity(
-                CorimEntityMapBuilder::new()
-                    .entity_name("Test".into())
-                    .add_role(CorimRoleTypeChoice::ManifestCreator)
-                    .build()
-                    .expect("build entity"),
-            )
-            .add_tag(comid_tag.into())
+        let corim_map = CorimBuilder::new(CorimId::Text("OVL3_TDISP_Trust_SVN".into()))
+            .add_entity(EntityMap {
+                entity_name: "Test".into(),
+                reg_id: None,
+                role: vec![CORIM_ROLE_MANIFEST_CREATOR],
+            })
+            .add_comid_tag(comid_tag)
+            .expect("add comid tag")
             .build()
             .expect("build corim");
 
-        corim_rs::ConciseRimTypeChoice::Unsigned(corim_map.into())
+        Corim::Unsigned(corim_map)
     }
 
     /// Build SVN measurement records for blocks 15–20 with the given SVN value.

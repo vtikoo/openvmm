@@ -11,16 +11,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Use the corim-rs types from the local extension
-use corim_rs::{
-    Bytes, ClassMap, ConciseMidTagBuilder, ConditionalEndorsementSeriesTripleRecord,
-    ConditionalSeriesRecord, CorimEntityMapBuilder, CorimMapBuilder, CorimRoleTypeChoice,
-    CryptoKeyTypeChoice, Digest, EnvironmentMap, HashAlgorithm, IdentityTripleRecord, Integer,
-    InstanceIdTypeChoice, IntegrityRegisters, MeasuredElementTypeChoice, MeasurementMap,
-    MeasurementValuesMapBuilder, MinSvnType, ReferenceTripleRecord, StatefulEnvironmentRecord,
-    SvnTypeChoice, TagIdentityMap, TaggedBytes, TriplesMapBuilder, Tstr, Uint, Ulabel, VersionMap,
-    VersionScheme,
-};
+use corim::builder::{ComidBuilder, CorimBuilder};
+use corim::cbor;
+use corim::cbor::value::Value;
+use corim::profile::intel::MVAL_TEE_TCBSTATUS;
+use corim::types::common::{CryptoKey, EntityMap, MeasuredElement, TagIdChoice, VersionMap};
+use corim::types::corim::{CorimId, CorimMap};
+use corim::types::environment::{ClassMap, EnvironmentMap};
+use corim::types::measurement::{Digest, IntegrityRegisterId, IntegrityRegisters, MeasurementMap, MeasurementValuesMap, SvnChoice};
+use corim::types::tags::{COMID_ROLE_TAG_CREATOR, CORIM_ROLE_MANIFEST_CREATOR, TAG_CORIM, VERSION_SCHEME_MULTIPARTNUMERIC};
+use corim::types::triples::{CesCondition, ConditionalEndorsementSeriesTriple, ConditionalSeriesRecord, IdentityTriple, ReferenceTriple};
 use openssl::hash::DigestBytes;
 
 /// Specifies which triple should contain wrong data for negative testing.
@@ -171,6 +171,40 @@ const MSFT_LAYER1: MicrosoftLayer1 = MicrosoftLayer1 {
     layer: 1,
 };
 
+const SHA256_ALG_ID: i64 = 1;
+const SHA384_ALG_ID: i64 = 7;
+
+fn digest(alg: i64, bytes: &[u8]) -> Digest {
+    Digest::new(alg, bytes.to_vec())
+}
+
+fn multipart_version(version: &str) -> VersionMap {
+    VersionMap {
+        version: version.into(),
+        version_scheme: Some(VERSION_SCHEME_MULTIPARTNUMERIC),
+    }
+}
+
+fn bytes_instance(bytes: &[u8]) -> corim::types::common::InstanceIdChoice {
+    corim::types::common::InstanceIdChoice::Bytes(bytes.to_vec())
+}
+
+fn tcb_status_measurement(status: &str) -> MeasurementMap {
+    let mut mval = MeasurementValuesMap::default();
+    mval.extra_entries
+        .insert(MVAL_TEE_TCBSTATUS, Value::Text(status.into()));
+
+    MeasurementMap {
+        mkey: None,
+        mval,
+        authorized_by: None,
+    }
+}
+
+fn encode_corim(corim_map: CorimMap) -> Result<Vec<u8>> {
+    Ok(cbor::encode(&cbor::value::Tagged::new(TAG_CORIM, corim_map))?)
+}
+
 /// Generate a CORIM file with Microsoft certificate values
 pub fn generate_microsoft_corim(_root_thumbprint: Option<&DigestBytes>) -> Result<Vec<u8>> {
     generate_microsoft_corim_impl()
@@ -213,12 +247,9 @@ pub fn generate_manticore_corim_pair_with_case(test_case: NegativeTestCase) -> R
     // Create Trust CORIM with endorsement information
     let trust_corim = create_manticore_trust_corim(test_case)?;
 
-    // Serialize to CBOR
-    let mut auth_cbor = Vec::new();
-    ciborium::into_writer(&auth_corim, &mut auth_cbor)?;
-    
-    let mut trust_cbor = Vec::new();
-    ciborium::into_writer(&trust_corim, &mut trust_cbor)?;
+    // Serialize to tagged CoRIM CBOR that matches the Azure decoder.
+    let auth_cbor = encode_corim(auth_corim)?;
+    let trust_cbor = encode_corim(trust_corim)?;
 
     // Encode as base64
     let auth_b64 = base64_engine.encode(&auth_cbor);
@@ -387,26 +418,20 @@ pub const MANTICORE_SPDM_MEASUREMENTS: [(u8, &[u8; 48]); 36] = [
 
 /// Create Manticore Authenticity CORIM with device identity and TCBInfo reference triples
 #[allow(dead_code)]
-fn create_manticore_auth_corim(root_thumbprint: &[u8; 48], test_case: NegativeTestCase) -> Result<corim_rs::CorimMap<'static>> {
-    use corim_rs::CertThumbprintType;
-
+fn create_manticore_auth_corim(root_thumbprint: &[u8; 48], test_case: NegativeTestCase) -> Result<CorimMap> {
     // Create identity triple with the actual root certificate thumbprint
-    let cert_thumbprint = CertThumbprintType(ciborium::tag::Accepted(Digest {
-        alg: HashAlgorithm::Sha384,
-        val: Bytes::from(root_thumbprint.as_slice()),
-    }));
-
-    let identity_triple = IdentityTripleRecord {
-        environment: EnvironmentMap {
+    let identity_triple = IdentityTriple::new(
+        EnvironmentMap {
             class: None,
-            instance: Some(InstanceIdTypeChoice::Bytes(
-                TaggedBytes::from(b"SPDM_certificate".as_slice()),
-            )),
+            instance: Some(bytes_instance(b"SPDM_certificate")),
             group: None,
         },
-        key_list: vec![CryptoKeyTypeChoice::CertThumbprint(cert_thumbprint)],
-        conditions: None,
-    };
+        vec![CryptoKey::CertThumbprint(digest(
+            SHA384_ALG_ID,
+            root_thumbprint.as_slice(),
+        ))],
+        None,
+    );
 
     // TCBInfo instance identifier: base64("TCBInfo") = "VENCSW5mbw=="
     let tcbinfo_instance = base64_engine.encode("TCBInfo");
@@ -422,131 +447,110 @@ fn create_manticore_auth_corim(root_thumbprint: &[u8; 48], test_case: NegativeTe
     }
 
     // Layer 0 TCBInfo reference triple (maps to cert #0 / root cert)
-    let layer0_ref_triple = ReferenceTripleRecord {
-        ref_env: EnvironmentMap {
+    let layer0_ref_triple = ReferenceTriple::new(
+        EnvironmentMap {
             class: Some(ClassMap {
                 class_id: None,
                 vendor: None,
                 model: None,
-                layer: Some(Uint::from(0u64)),
+                layer: Some(0),
                 index: None,
             }),
-            instance: Some(InstanceIdTypeChoice::Bytes(TaggedBytes::from(
-                tcbinfo_instance.as_bytes(),
-            ))),
+            instance: Some(bytes_instance(tcbinfo_instance.as_bytes())),
             group: None,
         },
-        ref_claims: vec![MeasurementMap {
+        vec![MeasurementMap {
             mkey: None,
-            mval: MeasurementValuesMapBuilder::new()
-                .version(VersionMap::from((
-                    Tstr::from("3.3.5.0-50701001"),
-                    Some(VersionScheme::Multipartnumeric),
-                )))
-                .svn(SvnTypeChoice::Svn(Uint::from(0u64)))
-                .digest(vec![Digest {
-                    alg: HashAlgorithm::Sha384,
-                    val: Bytes::from(layer0_fwid.as_slice()),
-                }])
-                .build()?,
+            mval: MeasurementValuesMap {
+                version: Some(multipart_version("3.3.5.0-50701001")),
+                svn: Some(SvnChoice::ExactValue(0)),
+                digests: Some(vec![digest(SHA384_ALG_ID, layer0_fwid.as_slice())]),
+                ..MeasurementValuesMap::default()
+            },
             authorized_by: None,
         }],
-    };
+    );
 
     // Layer 1 TCBInfo reference triple (maps to cert #1 / alias cert)
-    let layer1_ref_triple = ReferenceTripleRecord {
-        ref_env: EnvironmentMap {
+    let layer1_ref_triple = ReferenceTriple::new(
+        EnvironmentMap {
             class: Some(ClassMap {
                 class_id: None,
                 vendor: None,
                 model: None,
-                layer: Some(Uint::from(1u64)),
+                layer: Some(1),
                 index: None,
             }),
-            instance: Some(InstanceIdTypeChoice::Bytes(TaggedBytes::from(
-                tcbinfo_instance.as_bytes(),
-            ))),
+            instance: Some(bytes_instance(tcbinfo_instance.as_bytes())),
             group: None,
         },
-        ref_claims: vec![MeasurementMap {
+        vec![MeasurementMap {
             mkey: None,
-            mval: MeasurementValuesMapBuilder::new()
-                .version(VersionMap::from((
-                    Tstr::from("0.0.0.0-50725215beta(X)"),
-                    Some(VersionScheme::Multipartnumeric),
-                )))
-                .svn(SvnTypeChoice::Svn(Uint::from(0u64)))
-                .digest(vec![Digest {
-                    alg: HashAlgorithm::Sha384,
-                    val: Bytes::from(layer1_fwid.as_slice()),
-                }])
-                .build()?,
+            mval: MeasurementValuesMap {
+                version: Some(multipart_version("0.0.0.0-50725215beta(X)")),
+                svn: Some(SvnChoice::ExactValue(0)),
+                digests: Some(vec![digest(SHA384_ALG_ID, layer1_fwid.as_slice())]),
+                ..MeasurementValuesMap::default()
+            },
             authorized_by: None,
         }],
-    };
+    );
 
     // SPDM Measurement reference triple with all 36 measurement records from the real device
     // The instance identifier must contain "SPDMMeasurement" (base64-encoded) to be
     // recognized by is_spdm_measurements_record() during validation.
     let spdm_measurement_instance = base64_engine.encode("SPDMMeasurement");
 
-    let spdm_measurement_claims: Vec<MeasurementMap<'static>> = MANTICORE_SPDM_MEASUREMENTS
+    let spdm_measurement_claims: Vec<MeasurementMap> = MANTICORE_SPDM_MEASUREMENTS
         .iter()
-        .map(|(index, digest)| {
+        .map(|(index, measurement_digest)| {
             // For BadSpdmMeasurement, corrupt measurement #1 (first byte flipped)
-            let mut digest_bytes = (*digest).clone();
+            let mut digest_bytes = (*measurement_digest).clone();
             if test_case == NegativeTestCase::BadSpdmMeasurement && *index == 1 {
                 digest_bytes[0] ^= 0xFF;
             }
             MeasurementMap {
-                mkey: Some(MeasuredElementTypeChoice::UInt(Uint::from(*index as u64))),
-                mval: MeasurementValuesMapBuilder::new()
-                    .digest(vec![Digest {
-                        alg: HashAlgorithm::Sha384,
-                        val: Bytes::from(digest_bytes.as_slice()),
-                    }])
-                    .build()
-                    .expect("Failed to build measurement values"),
+                mkey: Some(MeasuredElement::Uint(*index as u64)),
+                mval: MeasurementValuesMap {
+                    digests: Some(vec![digest(SHA384_ALG_ID, digest_bytes.as_slice())]),
+                    ..MeasurementValuesMap::default()
+                },
                 authorized_by: None,
             }
         })
         .collect();
 
-    let spdm_measurement_triple = ReferenceTripleRecord {
-        ref_env: EnvironmentMap {
+    let spdm_measurement_triple = ReferenceTriple::new(
+        EnvironmentMap {
             class: None,
-            instance: Some(InstanceIdTypeChoice::Bytes(TaggedBytes::from(
-                spdm_measurement_instance.as_bytes(),
-            ))),
+            instance: Some(bytes_instance(spdm_measurement_instance.as_bytes())),
             group: None,
         },
-        ref_claims: spdm_measurement_claims,
-    };
+        spdm_measurement_claims,
+    );
 
     // Create CoMID tag with identity triple, TCBInfo reference triples, AND SPDM measurement triple
-    let comid_tag = ConciseMidTagBuilder::new()
-        .tag_identity(TagIdentityMap {
-            tag_id: "manticore-auth-v1".into(),
-            tag_version: Some(1.into()),
+    let comid_tag = ComidBuilder::new(TagIdChoice::Text("manticore-auth-v1".into()))
+        .set_tag_version(1)
+        .add_entity(EntityMap {
+            entity_name: "Microsoft Corporation".into(),
+            reg_id: None,
+            role: vec![COMID_ROLE_TAG_CREATOR],
         })
-        .triples(
-            TriplesMapBuilder::new()
-                .identity_triples(vec![identity_triple])
-                .reference_triples(vec![layer0_ref_triple, layer1_ref_triple, spdm_measurement_triple])
-                .build()?,
-        )
+        .add_identity_triple(identity_triple)
+        .add_reference_triple(layer0_ref_triple)
+        .add_reference_triple(layer1_ref_triple)
+        .add_reference_triple(spdm_measurement_triple)
         .build()?;
 
     // Create CORIM map
-    let corim_map = CorimMapBuilder::new()
-        .id("manticore-auth-corim-v1".into())
-        .add_entity(
-            CorimEntityMapBuilder::new()
-                .entity_name("Microsoft Corporation".into())
-                .add_role(CorimRoleTypeChoice::ManifestCreator)
-                .build()?,
-        )
-        .add_tag(comid_tag.into())
+    let corim_map = CorimBuilder::new(CorimId::Text("manticore-auth-corim-v1".into()))
+        .add_entity(EntityMap {
+            entity_name: "Microsoft Corporation".into(),
+            reg_id: None,
+            role: vec![CORIM_ROLE_MANIFEST_CREATOR],
+        })
+        .add_comid_tag(comid_tag)?
         .build()?;
 
     Ok(corim_map)
@@ -562,9 +566,7 @@ fn create_manticore_auth_corim(root_thumbprint: &[u8; 48], test_case: NegativeTe
 /// First-match-wins semantics: if the device SVN meets the current threshold, it's UpToDate;
 /// otherwise the catch-all marks it OutOfDate.
 #[allow(dead_code)]
-fn create_manticore_trust_corim(test_case: NegativeTestCase) -> Result<corim_rs::CorimMap<'static>> {
-    use std::borrow::Cow;
-
+fn create_manticore_trust_corim(test_case: NegativeTestCase) -> Result<CorimMap> {
     // TCBInfo instance identifier: base64("TCBInfo") = "VENCSW5mbw=="
     let tcbinfo_instance = base64_engine.encode("TCBInfo");
 
@@ -595,46 +597,42 @@ fn create_manticore_trust_corim(test_case: NegativeTestCase) -> Result<corim_rs:
                 class_id: None,
                 vendor: None,
                 model: None,
-                layer: Some(Uint::from(*layer_index)),
+                layer: Some(*layer_index),
                 index: None,
             }),
-            instance: Some(InstanceIdTypeChoice::Bytes(TaggedBytes::from(
-                tcbinfo_instance.as_bytes(),
-            ))),
+            instance: Some(bytes_instance(tcbinfo_instance.as_bytes())),
             group: None,
         };
 
         // Condition claims: min_svn >= 0 (baseline - matches everything)
         let condition_claims = vec![MeasurementMap {
             mkey: None,
-            mval: MeasurementValuesMapBuilder::new()
-                .svn(SvnTypeChoice::TaggedMinSvn(MinSvnType::from(Integer(0))))
-                .build()?,
+            mval: MeasurementValuesMap {
+                svn: Some(SvnChoice::MinValue(0)),
+                ..MeasurementValuesMap::default()
+            },
             authorized_by: None,
         }];
 
-        let condition = StatefulEnvironmentRecord::new(condition_env, condition_claims);
+        let condition = CesCondition {
+            environment: condition_env,
+            claims_list: condition_claims,
+            authorized_by: None,
+        };
 
         // Series entry 1: selection min_svn >= current_svn → UpToDate
         let up_to_date_series = ConditionalSeriesRecord::new(
             // selection: min_svn >= current_svn (e.g., >= 1)
             vec![MeasurementMap {
                 mkey: None,
-                mval: MeasurementValuesMapBuilder::new()
-                    .svn(SvnTypeChoice::TaggedMinSvn(MinSvnType::from(Integer(
-                        *current_svn as i128,
-                    ))))
-                    .build()?,
+                mval: MeasurementValuesMap {
+                    svn: Some(SvnChoice::MinValue(*current_svn)),
+                    ..MeasurementValuesMap::default()
+                },
                 authorized_by: None,
             }],
             // addition: tcb-status = "UpToDate"
-            vec![MeasurementMap {
-                mkey: None,
-                mval: MeasurementValuesMapBuilder::new()
-                    .tcb_status(Cow::from("UpToDate"))
-                    .build()?,
-                authorized_by: None,
-            }],
+            vec![tcb_status_measurement("UpToDate")],
         );
 
         // Series entry 2: selection min_svn >= 0 (catch-all) → OutOfDate
@@ -642,22 +640,17 @@ fn create_manticore_trust_corim(test_case: NegativeTestCase) -> Result<corim_rs:
             // selection: min_svn >= 0 (catches anything not caught above)
             vec![MeasurementMap {
                 mkey: None,
-                mval: MeasurementValuesMapBuilder::new()
-                    .svn(SvnTypeChoice::TaggedMinSvn(MinSvnType::from(Integer(0))))
-                    .build()?,
+                mval: MeasurementValuesMap {
+                    svn: Some(SvnChoice::MinValue(0)),
+                    ..MeasurementValuesMap::default()
+                },
                 authorized_by: None,
             }],
             // addition: tcb-status = "OutOfDate"
-            vec![MeasurementMap {
-                mkey: None,
-                mval: MeasurementValuesMapBuilder::new()
-                    .tcb_status(Cow::from("OutOfDate"))
-                    .build()?,
-                authorized_by: None,
-            }],
+            vec![tcb_status_measurement("OutOfDate")],
         );
 
-        let triple = ConditionalEndorsementSeriesTripleRecord::new(
+        let triple = ConditionalEndorsementSeriesTriple::new(
             condition,
             vec![up_to_date_series, out_of_date_series],
         );
@@ -666,28 +659,27 @@ fn create_manticore_trust_corim(test_case: NegativeTestCase) -> Result<corim_rs:
     }
 
     // Create CoMID tag with conditional endorsement series triples
-    let comid_tag = ConciseMidTagBuilder::new()
-        .tag_identity(TagIdentityMap {
-            tag_id: "manticore-trust-v1".into(),
-            tag_version: Some(1.into()),
-        })
-        .triples(
-            TriplesMapBuilder::new()
-                .conditional_endorsement_series_triples(cond_endorsement_series)
-                .build()?,
-        )
+    let mut comid_builder = ComidBuilder::new(TagIdChoice::Text("manticore-trust-v1".into()))
+        .set_tag_version(1)
+        .add_entity(EntityMap {
+            entity_name: "Microsoft Corporation".into(),
+            reg_id: None,
+            role: vec![COMID_ROLE_TAG_CREATOR],
+        });
+    for triple in cond_endorsement_series {
+        comid_builder = comid_builder.add_conditional_endorsement_series(triple);
+    }
+    let comid_tag = comid_builder
         .build()?;
 
     // Create CORIM map
-    let corim_map = CorimMapBuilder::new()
-        .id("manticore-trust-corim-v1".into())
-        .add_entity(
-            CorimEntityMapBuilder::new()
-                .entity_name("Microsoft Corporation".into())
-                .add_role(CorimRoleTypeChoice::ManifestCreator)
-                .build()?,
-        )
-        .add_tag(comid_tag.into())
+    let corim_map = CorimBuilder::new(CorimId::Text("manticore-trust-corim-v1".into()))
+        .add_entity(EntityMap {
+            entity_name: "Microsoft Corporation".into(),
+            reg_id: None,
+            role: vec![CORIM_ROLE_MANIFEST_CREATOR],
+        })
+        .add_comid_tag(comid_tag)?
         .build()?;
 
     Ok(corim_map)
@@ -718,10 +710,7 @@ fn generate_microsoft_corim_impl() -> Result<Vec<u8>> {
     );
 
     // Create the digest for FWID (use raw bytes, not base64)
-    let test_l0_fwid_digest = Digest {
-        alg: HashAlgorithm::Sha384,
-        val: Bytes::from(TEST_FWID_DIGEST.as_slice()),
-    };
+    let test_l0_fwid_digest = digest(SHA384_ALG_ID, TEST_FWID_DIGEST.as_slice());
     println!(
         "  [NOTE] Test FWID digest: {}",
         hex::encode(&TEST_FWID_DIGEST)
@@ -730,39 +719,24 @@ fn generate_microsoft_corim_impl() -> Result<Vec<u8>> {
     // Integrity registers for layer 0
     let mut l0_map = BTreeMap::new();
     l0_map
-        .entry(Ulabel::Text(std::borrow::Cow::Borrowed("FW")))
-        .or_insert(vec![Digest {
-            alg: HashAlgorithm::Sha384,
-            val: Bytes::from(TEST_L0_INTREG_FW.as_slice()),
-        }]);
+        .entry(IntegrityRegisterId::Text("FW".into()))
+        .or_insert(vec![digest(SHA384_ALG_ID, TEST_L0_INTREG_FW.as_slice())]);
     l0_map
-        .entry(Ulabel::Text(std::borrow::Cow::Borrowed("TC")))
-        .or_insert(vec![Digest {
-            alg: HashAlgorithm::Sha384,
-            val: Bytes::from(TEST_L0_INTREG_TC.as_slice()),
-        }]);
+        .entry(IntegrityRegisterId::Text("TC".into()))
+        .or_insert(vec![digest(SHA384_ALG_ID, TEST_L0_INTREG_TC.as_slice())]);
     let test_l0_intreg = IntegrityRegisters(l0_map);
 
     // Create the digest for FWID layer 1 (use raw bytes, not base64)
-    let test_l1_fwid_digest = Digest {
-        alg: HashAlgorithm::Sha384,
-        val: Bytes::from(TEST_FWID_DIGEST_LAYER1.as_slice()),
-    };
+    let test_l1_fwid_digest = digest(SHA384_ALG_ID, TEST_FWID_DIGEST_LAYER1.as_slice());
     println!(
         "  [NOTE] Test FWID Layer 1 digest: {}",
         hex::encode(&TEST_FWID_DIGEST_LAYER1)
     );
 
     // Create test SPDM measurement digests
-    let test_measurement_1_digest = Digest {
-        alg: HashAlgorithm::Sha256,
-        val: Bytes::from(TEST_SPDM_MEASUREMENT_1.as_slice()),
-    };
+    let test_measurement_1_digest = digest(SHA256_ALG_ID, TEST_SPDM_MEASUREMENT_1.as_slice());
 
-    let test_measurement_2_digest = Digest {
-        alg: HashAlgorithm::Sha256,
-        val: Bytes::from(TEST_SPDM_MEASUREMENT_2.as_slice()),
-    };
+    let test_measurement_2_digest = digest(SHA256_ALG_ID, TEST_SPDM_MEASUREMENT_2.as_slice());
     println!(
         "  [NOTE] Test SPDM measurement 1: {}",
         hex::encode(&TEST_SPDM_MEASUREMENT_1)
@@ -773,141 +747,113 @@ fn generate_microsoft_corim_impl() -> Result<Vec<u8>> {
     );
 
     // Create version maps for Microsoft versions
-    let layer0_version = VersionMap::from((
-        MSFT_LAYER0.version.into(),
-        Some(VersionScheme::Multipartnumeric),
-    ));
-    let layer1_version = VersionMap::from((
-        MSFT_LAYER1.version.into(),
-        Some(VersionScheme::Multipartnumeric),
-    ));
+    let layer0_version = multipart_version(MSFT_LAYER0.version);
+    let layer1_version = multipart_version(MSFT_LAYER1.version);
 
-    // Build the CORIM using the corim-rs builders
-    let corim_map = CorimMapBuilder::new()
-        .id("microsoft-tdisp-test-corim".into())
-        .add_tag(
-            ConciseMidTagBuilder::new()
-                .tag_identity(TagIdentityMap {
-                    tag_id: "microsoft-tdisp-layer0".into(),
-                    tag_version: Some(1.into()),
-                })
-                .triples(
-                    TriplesMapBuilder::new()
-                        .reference_triples(vec![
-                            // Layer 0 TCBInfo reference triple
-                            ReferenceTripleRecord {
-                                ref_env: EnvironmentMap {
-                                    class: Some(ClassMap {
-                                        class_id: None,
-                                        vendor: Some(Tstr::from(MSFT_LAYER0.vendor)),
-                                        model: Some(Tstr::from(MSFT_LAYER0.model)),
-                                        layer: Some(Uint::from(MSFT_LAYER0.layer)),
-                                        index: None,
-                                    }),
-                                    instance: Some(InstanceIdTypeChoice::Bytes(TaggedBytes::from(
-                                        tcbinfo_instance.as_bytes(),
-                                    ))),
-                                    group: None,
-                                },
-                                ref_claims: vec![MeasurementMap {
-                                    mkey: None,
-                                    mval: MeasurementValuesMapBuilder::new()
-                                        .version(layer0_version.clone())
-                                        .svn(MSFT_LAYER0.svn.into())
-                                        .digest(vec![test_l0_fwid_digest])
-                                        .integrity_registers(test_l0_intreg)
-                                        .build()?,
-                                    authorized_by: None,
-                                }],
-                            },
-                            // Layer 1 TCBInfo reference triple
-                            ReferenceTripleRecord {
-                                ref_env: EnvironmentMap {
-                                    class: Some(ClassMap {
-                                        class_id: None,
-                                        vendor: Some(Tstr::from(MSFT_LAYER1.vendor)),
-                                        model: Some(Tstr::from(MSFT_LAYER1.model)),
-                                        layer: Some(Uint::from(MSFT_LAYER1.layer)),
-                                        index: None,
-                                    }),
-                                    instance: Some(InstanceIdTypeChoice::Bytes(TaggedBytes::from(
-                                        tcbinfo_instance.as_bytes(),
-                                    ))),
-                                    group: None,
-                                },
-                                ref_claims: vec![MeasurementMap {
-                                    mkey: None,
-                                    mval: MeasurementValuesMapBuilder::new()
-                                        .version(layer1_version)
-                                        .svn(MSFT_LAYER1.svn.into())
-                                        .digest(vec![test_l1_fwid_digest])
-                                        .build()?,
-                                    authorized_by: None,
-                                }],
-                            },
-                            // SPDM Measurement 1 reference triple
-                            ReferenceTripleRecord {
-                                ref_env: EnvironmentMap {
-                                    class: None,
-                                    instance: Some(InstanceIdTypeChoice::Bytes(TaggedBytes::from(
-                                        spdm_measurement_instance.as_bytes(),
-                                    ))),
-                                    group: None,
-                                },
-                                ref_claims: vec![
-                                    MeasurementMap {
-                                        mkey: Some(MeasuredElementTypeChoice::UInt(Uint::from(
-                                            1u64,
-                                        ))),
-                                        mval: MeasurementValuesMapBuilder::new()
-                                            .digest(vec![test_measurement_1_digest])
-                                            .build()?,
-                                        authorized_by: None,
-                                    },
-                                    MeasurementMap {
-                                        mkey: Some(MeasuredElementTypeChoice::UInt(Uint::from(
-                                            2u64,
-                                        ))),
-                                        mval: MeasurementValuesMapBuilder::new()
-                                            .digest(vec![test_measurement_2_digest])
-                                            .build()?,
-                                        authorized_by: None,
-                                    },
-                                ],
-                            },
-                        ])
-                        .identity_triples(vec![IdentityTripleRecord {
-                            environment: EnvironmentMap {
-                                class: None,
-                                instance: Some(InstanceIdTypeChoice::Bytes(TaggedBytes::from(
-                                    spdm_certificate_instance.as_bytes(),
-                                ))),
-                                group: None,
-                            },
-                            key_list: vec![CryptoKeyTypeChoice::CertThumbprint(
-                                corim_rs::CertThumbprintType::from(Digest {
-                                    alg: HashAlgorithm::Sha384,
-                                    val: Bytes::from(TEST_FWID_DIGEST_LAYER1.as_slice()),
-                                }),
-                            )],
-                            conditions: None,
-                        }])
-                        .build()?,
-                )
-                .build()?
-                .into(),
-        )
-        .add_entity(
-            CorimEntityMapBuilder::new()
-                .entity_name("Microsoft Test Generator".into())
-                .add_role(CorimRoleTypeChoice::ManifestCreator)
-                .build()?,
-        )
+    let comid = ComidBuilder::new(TagIdChoice::Text("microsoft-tdisp-layer0".into()))
+        .set_tag_version(1)
+        .add_entity(EntityMap {
+            entity_name: "Microsoft Test Generator".into(),
+            reg_id: None,
+            role: vec![COMID_ROLE_TAG_CREATOR],
+        })
+        .add_reference_triple(ReferenceTriple::new(
+            EnvironmentMap {
+                class: Some(ClassMap {
+                    class_id: None,
+                    vendor: Some(MSFT_LAYER0.vendor.into()),
+                    model: Some(MSFT_LAYER0.model.into()),
+                    layer: Some(MSFT_LAYER0.layer),
+                    index: None,
+                }),
+                instance: Some(bytes_instance(tcbinfo_instance.as_bytes())),
+                group: None,
+            },
+            vec![MeasurementMap {
+                mkey: None,
+                mval: MeasurementValuesMap {
+                    version: Some(layer0_version.clone()),
+                    svn: Some(SvnChoice::ExactValue(MSFT_LAYER0.svn)),
+                    digests: Some(vec![test_l0_fwid_digest]),
+                    integrity_registers: Some(test_l0_intreg),
+                    ..MeasurementValuesMap::default()
+                },
+                authorized_by: None,
+            }],
+        ))
+        .add_reference_triple(ReferenceTriple::new(
+            EnvironmentMap {
+                class: Some(ClassMap {
+                    class_id: None,
+                    vendor: Some(MSFT_LAYER1.vendor.into()),
+                    model: Some(MSFT_LAYER1.model.into()),
+                    layer: Some(MSFT_LAYER1.layer),
+                    index: None,
+                }),
+                instance: Some(bytes_instance(tcbinfo_instance.as_bytes())),
+                group: None,
+            },
+            vec![MeasurementMap {
+                mkey: None,
+                mval: MeasurementValuesMap {
+                    version: Some(layer1_version),
+                    svn: Some(SvnChoice::ExactValue(MSFT_LAYER1.svn)),
+                    digests: Some(vec![test_l1_fwid_digest]),
+                    ..MeasurementValuesMap::default()
+                },
+                authorized_by: None,
+            }],
+        ))
+        .add_reference_triple(ReferenceTriple::new(
+            EnvironmentMap {
+                class: None,
+                instance: Some(bytes_instance(spdm_measurement_instance.as_bytes())),
+                group: None,
+            },
+            vec![
+                MeasurementMap {
+                    mkey: Some(MeasuredElement::Uint(1)),
+                    mval: MeasurementValuesMap {
+                        digests: Some(vec![test_measurement_1_digest]),
+                        ..MeasurementValuesMap::default()
+                    },
+                    authorized_by: None,
+                },
+                MeasurementMap {
+                    mkey: Some(MeasuredElement::Uint(2)),
+                    mval: MeasurementValuesMap {
+                        digests: Some(vec![test_measurement_2_digest]),
+                        ..MeasurementValuesMap::default()
+                    },
+                    authorized_by: None,
+                },
+            ],
+        ))
+        .add_identity_triple(IdentityTriple::new(
+            EnvironmentMap {
+                class: None,
+                instance: Some(bytes_instance(spdm_certificate_instance.as_bytes())),
+                group: None,
+            },
+            vec![CryptoKey::CertThumbprint(digest(
+                SHA384_ALG_ID,
+                TEST_FWID_DIGEST_LAYER1.as_slice(),
+            ))],
+            None,
+        ))
         .build()?;
 
-    // Serialize to CBOR
-    let mut cbor_data = Vec::new();
-    ciborium::into_writer(&corim_map, &mut cbor_data)?;
+    let corim_map = CorimBuilder::new(CorimId::Text("microsoft-tdisp-test-corim".into()))
+        .add_comid_tag(comid)?
+        .add_entity(EntityMap {
+            entity_name: "Microsoft Test Generator".into(),
+            reg_id: None,
+            role: vec![CORIM_ROLE_MANIFEST_CREATOR],
+        })
+        .build()?;
+
+    // Serialize to tagged CoRIM CBOR that matches the Azure decoder.
+    let cbor_data = encode_corim(corim_map)?;
 
     println!("  [SUCCESS] Generated CORIM with {} bytes", cbor_data.len());
     println!("  [INFO] CORIM contains:");
@@ -972,10 +918,10 @@ mod tests {
             .decode(auth_b64).expect("Failed to decode auth CORIM base64");
         let trust_bytes = base64::engine::general_purpose::STANDARD
             .decode(trust_b64).expect("Failed to decode trust CORIM base64");
-        let _: corim_rs::CorimMap<'_> = ciborium::de::from_reader(auth_bytes.as_slice())
-            .expect("Auth CORIM should be valid CBOR");
-        let _: corim_rs::CorimMap<'_> = ciborium::de::from_reader(trust_bytes.as_slice())
-            .expect("Trust CORIM should be valid CBOR");
+        let _: cbor::value::Tagged<CorimMap> = cbor::decode(auth_bytes.as_slice())
+            .expect("Auth CORIM should be valid tagged CBOR");
+        let _: cbor::value::Tagged<CorimMap> = cbor::decode(trust_bytes.as_slice())
+            .expect("Trust CORIM should be valid tagged CBOR");
 
         println!("\n{}", "=".repeat(80));
         println!("MANTICORE TDISP DEVICE RIMS JSON (positive case)");
