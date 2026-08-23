@@ -109,7 +109,7 @@ pub async fn relay_vpci_bus(
     offer_info: vmbus_client::OfferInfo,
     dma_client: &dyn DmaClient,
     vmbus: &vmbus_server::VmbusServerControl,
-    tdisp_verifier: Option<&Arc<underhill_attestation::tdisp::TdispVerifier<'static>>>,
+    tdisp_verifier: Option<&Arc<underhill_attestation::tdisp::TdispVerifier>>,
 ) -> anyhow::Result<()> {
     let instance_id = offer_info.offer.instance_id;
 

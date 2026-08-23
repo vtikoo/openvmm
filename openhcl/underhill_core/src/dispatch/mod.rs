@@ -186,7 +186,7 @@ pub(crate) struct LoadedVm {
     pub dma_manager: OpenhclDmaManager,
     
     /// TDISP verifier for device attestation
-    pub tdisp_verifier: Option<underhill_attestation::tdisp::TdispVerifier<'static>>,
+    pub tdisp_verifier: Option<underhill_attestation::tdisp::TdispVerifier>,
 }
 
 pub struct LoadedVmState<T> {
